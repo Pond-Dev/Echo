@@ -465,6 +465,12 @@ pub struct Choice {
     /// Whether the view is inside the target this pass — the moment the pull
     /// is finished. The caller latches it for the rest of the press.
     pub arrived: bool,
+    /// How far away the target is, in world units.
+    ///
+    /// Reported because an angle alone cannot be read: two and a half degrees
+    /// close up and half a degree far off are the same distance from a chest,
+    /// and which one a log is showing decides whether a shot landed.
+    pub distance: f32,
     /// The movement to send, or the reason there is none.
     pub counts: Result<[i32; 2], Refusal>,
 }
@@ -480,6 +486,7 @@ impl Steering {
             target: None,
             offset: Offset::default(),
             arrived: false,
+            distance: 0.0,
             counts: Err(Refusal::NotHeld),
         };
         choice.counts = self.decide(now, grip, push, &mut choice);
@@ -576,6 +583,7 @@ impl Steering {
         // was taken from.
         choice.target = Some(pawn);
         choice.offset = offset;
+        choice.distance = distance;
         choice.arrived = offset.size() <= self.handover(distance);
 
         // The pull is one pull. Once the view is anywhere inside the target

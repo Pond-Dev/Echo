@@ -489,6 +489,10 @@ struct Aim {
     /// rebuilt, because what it knows is where along the ramp it has got to
     /// and that does not belong to any one pass.
     grip: Grip,
+    /// How far away the target was, in world units. Kept so the offset can
+    /// be read as a length on a chest rather than as an angle, which cannot
+    /// be read at all without it.
+    distance: f32,
     /// Whether the pull has finished during this press.
     ///
     /// Belongs to the press, so it lives here rather than in the deciding —
@@ -599,6 +603,7 @@ impl Aim {
         if held {
             self.target = choice.target;
             self.offset = choice.offset;
+            self.distance = choice.distance;
         }
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
@@ -633,9 +638,15 @@ impl Aim {
     fn describe(&self) -> String {
         let mut line = format!("aim {}", self.reason.label());
         if let Some(pawn) = self.target {
+            // The same miss twice: as the angle the steering works in, and as
+            // the length on a chest that says whether a shot would have
+            // landed. An angle on its own says neither.
+            let across = self.distance * self.offset.size().to_radians().tan();
             line += &format!(
-                "   target 0x{pawn:X}   off {:.2} deg (yaw {:+.2} pitch {:+.2})",
+                "   target 0x{pawn:X}   off {:.2} deg = {across:.0}u of {:.0}u at {:.0}u  (yaw {:+.2} pitch {:+.2})",
                 self.offset.size(),
+                STEERING.body_half_width,
+                self.distance,
                 self.offset.yaw,
                 self.offset.pitch
             );
