@@ -217,7 +217,6 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
                 &players,
                 angles,
                 Tick {
-                    now: started,
                     // One pass stale, since the period is closed at the end
                     // of a pass and this is the middle of the next. A few
                     // hundred microseconds against ramps measured in tens of
@@ -540,7 +539,6 @@ impl Pace {
 /// to be written in the wrong order without anything noticing.
 #[derive(Clone, Copy)]
 struct Tick {
-    now: Instant,
     /// Since the previous pass began.
     elapsed: Duration,
     /// The player's mouse. `None` when it cannot be read at all, which is
@@ -578,8 +576,13 @@ struct Aim {
     /// Whether the button is down, regardless of whether anything may come
     /// of it. What a press is counted from.
     held: bool,
-    /// When this press began.
-    pressed: Option<Instant>,
+    /// How much of this press has been spent actually steering.
+    ///
+    /// Counted rather than taken from the clock, because the passes where the
+    /// player had the view are not the pull's to be charged for — charging
+    /// them cancelled pulls for yielding, which is the one thing the assist
+    /// is most supposed to do.
+    pulled_for: Duration,
     /// Whether the pull finished on this very pass.
     ///
     /// The moment, not the state: the state stays true for the rest of the
@@ -637,7 +640,7 @@ impl Aim {
         angles: ViewAngles,
         tick: Tick,
     ) {
-        let Tick { now, elapsed, hand } = tick;
+        let Tick { elapsed, hand } = tick;
         let held = input::held(AIM_KEY);
         self.blocked = held && !allowed;
         let active = held && allowed;
@@ -653,7 +656,7 @@ impl Aim {
             self.passes = 0;
             self.pushed = 0;
             self.delivered_to = None;
-            self.pressed = Some(now);
+            self.pulled_for = Duration::ZERO;
         }
         self.held = held;
         self.active = active;
@@ -693,7 +696,7 @@ impl Aim {
                 players,
                 angles,
                 delivered_to: self.delivered_to,
-                pulling_for: self.pressed.map_or(Duration::ZERO, |at| now - at),
+                pulling_for: self.pulled_for,
             },
             RAMP,
             grip,
@@ -711,6 +714,11 @@ impl Aim {
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
         // which is the tracking this deliberately does not do.
+        // Charged only for the passes it steered on, and charged after the
+        // fact, so this pass is decided on what the pull had spent before it.
+        if choice.counts.is_ok() {
+            self.pulled_for += elapsed;
+        }
         self.just_delivered = choice.arrived && self.delivered_to.is_none();
         if choice.arrived {
             self.delivered_to = self.delivered_to.or(choice.target);
@@ -773,6 +781,13 @@ impl Aim {
         }
         if let Some(share) = (self.pushed * 100).checked_div(self.passes) {
             line += &format!("   hand {share}% of {} passes", self.passes);
+        }
+        if self.pulled_for > Duration::ZERO {
+            line += &format!(
+                "   pulled {:.0} of {:.0} ms",
+                self.pulled_for.as_secs_f64() * 1000.0,
+                STEERING.pull_limit.as_secs_f64() * 1000.0
+            );
         }
         if self.refused > 0 {
             line += &format!("   {} refused", self.refused);

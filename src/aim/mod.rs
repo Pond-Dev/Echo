@@ -178,7 +178,7 @@ pub struct Steering {
     /// ponytail: a guess at a fraction of a torso. Replace it with the real
     /// hitbox geometry, which the old product already has.
     pub settle_within: f32,
-    /// How long one press's pull may last before it gives up.
+    /// How much steering one press's pull may do before it gives up.
     ///
     /// The pull is meant to end once, and arriving was the only thing that
     /// ended it — so a press whose target stepped behind cover, or whose
@@ -187,9 +187,18 @@ pub struct Steering {
     /// this was built not to have: an assist fighting the recoil the player
     /// is compensating by hand, for thirty bullets.
     ///
+    /// **Time spent steering, not time since the button went down.** A press
+    /// where the player pushed back for half of it has not had half a pull;
+    /// it has had half as much of one, and cancelling it for taking too long
+    /// punishes the assist for doing the thing it is supposed to do. A log
+    /// caught exactly that — given up at a degree and a half off, with the
+    /// grip at eighteen per cent and the hand having pushed through half the
+    /// passes, and the grip back at full a fraction of a second later with
+    /// nothing left to spend it on.
+    ///
     /// Generous against what a pull costs — twenty-eight degrees took about
-    /// a hundred and twenty milliseconds — so reaching it means the pull is
-    /// not converging rather than that it needed longer.
+    /// a hundred and twenty milliseconds of steering — so reaching it means
+    /// the pull is not converging rather than that it needed longer.
     pub pull_limit: Duration,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
@@ -469,10 +478,12 @@ pub struct Situation<'a> {
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
     pub angles: ViewAngles,
-    /// How long the button has been down.
+    /// How much of this press has been spent steering.
     ///
-    /// Passed in rather than kept, for the same reason nothing in here is
-    /// told when a press began: it is the caller that knows what a press is.
+    /// Not how long the button has been down: the passes the player had the
+    /// view are not the pull's to be charged for. Passed in rather than kept,
+    /// for the same reason nothing in here is told when a press began — it is
+    /// the caller that knows what a press is.
     pub pulling_for: Duration,
     /// Who the pull of this press has already been spent on, if anyone.
     ///
@@ -1571,7 +1582,21 @@ mod tests {
         now.pulling_for = STEERING.pull_limit;
         assert!(
             STEERING.choose(&now, ramp(), 1.0, 0.0).counts.is_ok(),
-            "still within its time"
+            "still within what it may spend"
+        );
+
+        // And what it may spend is steering, not the clock. A press where the
+        // player pushed back through half of it has had half as much of a
+        // pull, not half a pull, and a log had one cancelled at a degree and
+        // a half off with the grip at eighteen per cent — punished for the
+        // yielding that is the point of the whole thing. Nothing here can
+        // enforce that on its own; what it can do is refuse to make the
+        // distinction impossible, which is why this is a duration in and not
+        // a press start.
+        now.pulling_for = Duration::ZERO;
+        assert!(
+            STEERING.choose(&now, ramp(), 0.0, 1.0).counts.is_err(),
+            "a pass the player has taken sends nothing"
         );
 
         now.pulling_for = STEERING.pull_limit + Duration::from_millis(1);
