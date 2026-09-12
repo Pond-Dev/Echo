@@ -201,6 +201,82 @@ impl Hand {
     }
 }
 
+/// What stopped the view from being steered this pass, if anything did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Refusal {
+    #[default]
+    NotHeld,
+    NotInFront,
+    NoLocalPlayer,
+    ViewImplausible,
+    NoPositionForUs,
+    NoEnemyInTheCone,
+    HandWins,
+    AlreadyOnTarget,
+    WindowsRefused,
+    Steering,
+}
+
+impl Refusal {
+    /// Every refusal there is, which is what makes a tally of them complete.
+    ///
+    /// Listed rather than derived, and held to the real list by a test: a
+    /// reason missing from here would be a reason nothing ever reports, which
+    /// is the exact shape of the failure the tally exists to catch.
+    pub const ALL: [Self; 10] = [
+        Self::NotHeld,
+        Self::NotInFront,
+        Self::NoLocalPlayer,
+        Self::ViewImplausible,
+        Self::NoPositionForUs,
+        Self::NoEnemyInTheCone,
+        Self::HandWins,
+        Self::AlreadyOnTarget,
+        Self::WindowsRefused,
+        Self::Steering,
+    ];
+
+    /// How many there are, for sizing a tally that cannot be indexed past.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// A short name, for a line that has to carry every one of them at once.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::NotHeld => "idle",
+            Self::NotInFront => "not-in-front",
+            Self::NoLocalPlayer => "no-local-player",
+            Self::ViewImplausible => "view-implausible",
+            Self::NoPositionForUs => "no-position",
+            Self::NoEnemyInTheCone => "no-enemy",
+            Self::HandWins => "hand",
+            Self::AlreadyOnTarget => "on-target",
+            Self::WindowsRefused => "windows-refused",
+            Self::Steering => "steering",
+        }
+    }
+
+    /// Whether the view is being held on a target. Moving onto one and
+    /// sitting on one are the same thing from outside.
+    pub const fn engaged(self) -> bool {
+        matches!(self, Self::Steering | Self::AlreadyOnTarget)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotHeld => "idle",
+            Self::NotInFront => "held, but the game is not in front",
+            Self::NoLocalPlayer => "no plausible reading of us",
+            Self::ViewImplausible => "view angles implausible — stale offsets?",
+            Self::NoPositionForUs => "our own position is not readable",
+            Self::NoEnemyInTheCone => "no living enemy in the cone",
+            Self::HandWins => "your hand",
+            Self::AlreadyOnTarget => "on target",
+            Self::WindowsRefused => "Windows refused the movement — not elevated?",
+            Self::Steering => "steering",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +508,32 @@ mod tests {
             assert!(still < Duration::from_secs(1), "never came back");
         }
         assert!(still <= yielding().settle + PASS, "took {still:?}");
+    }
+
+    #[test]
+    fn the_roll_call_of_refusals_holds_every_one_of_them_exactly_once() {
+        // A tally is indexed by the refusal itself, so a reason left out of
+        // the roll call is a reason whose count is kept and never printed —
+        // which is the silence the tally exists to break, reappearing inside
+        // the thing meant to break it.
+        let mut seen = [false; Refusal::COUNT];
+        for refusal in Refusal::ALL {
+            let index = refusal as usize;
+            assert!(index < Refusal::COUNT, "{refusal:?} indexes past the tally");
+            assert!(!seen[index], "{refusal:?} listed twice");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|seen| *seen), "a refusal has no slot");
+    }
+
+    #[test]
+    fn every_refusal_says_something_different() {
+        for (index, refusal) in Refusal::ALL.iter().enumerate() {
+            for other in &Refusal::ALL[index + 1..] {
+                assert_ne!(refusal.key(), other.key(), "{refusal:?} and {other:?}");
+                assert_ne!(refusal.label(), other.label(), "{refusal:?} and {other:?}");
+            }
+        }
     }
 
     #[test]

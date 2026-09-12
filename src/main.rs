@@ -32,7 +32,7 @@
 use std::time::{Duration, Instant};
 
 use echo::aim;
-use echo::aim::{Hand, Offset, Steering, Yield};
+use echo::aim::{Hand, Offset, Refusal, Steering, Yield};
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
@@ -273,6 +273,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
                 for line in pace.report() {
                     log.record(&line);
                 }
+                log.record(&aim.tally());
             }
         });
         if due_report {
@@ -508,51 +509,18 @@ struct Aim {
     passes: u32,
     yielded: u32,
     /// Why nothing is happening, when nothing is happening.
-    ///
-    /// Every refusal has its own name. A count that never moves off one of
-    /// them is how a rule that has quietly become impossible shows itself —
-    /// which is the failure the old product carried for fifteen versions
-    /// without anyone noticing.
     reason: Refusal,
-}
-
-/// What stopped the view from being steered this pass, if anything did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum Refusal {
-    #[default]
-    NotHeld,
-    NotInFront,
-    NoLocalPlayer,
-    ViewImplausible,
-    NoPositionForUs,
-    NoEnemyInTheCone,
-    HandWins,
-    AlreadyOnTarget,
-    WindowsRefused,
-    Steering,
-}
-
-impl Refusal {
-    /// Whether the view is being held on a target. Moving onto one and
-    /// sitting on one are the same thing from outside.
-    const fn engaged(self) -> bool {
-        matches!(self, Self::Steering | Self::AlreadyOnTarget)
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::NotHeld => "idle",
-            Self::NotInFront => "held, but the game is not in front",
-            Self::NoLocalPlayer => "no plausible reading of us",
-            Self::ViewImplausible => "view angles implausible — stale offsets?",
-            Self::NoPositionForUs => "our own position is not readable",
-            Self::NoEnemyInTheCone => "no living enemy in the cone",
-            Self::HandWins => "your hand",
-            Self::AlreadyOnTarget => "on target",
-            Self::WindowsRefused => "Windows refused the movement — not elevated?",
-            Self::Steering => "steering",
-        }
-    }
+    /// How many passes ended in each refusal, since the program started.
+    ///
+    /// The log records changes of state, which cannot tell a reason that
+    /// never happens from a reason that is never written down. A count that
+    /// sits at zero for a whole session is a discovery — a rule that has
+    /// quietly become impossible looks exactly like that, and is the failure
+    /// the old product carried for fifteen versions without anyone noticing.
+    ///
+    /// So the whole tally is printed every time, zeros and all. A line that
+    /// only lists what happened is the same silence in a shorter form.
+    tally: [u32; Refusal::COUNT],
 }
 
 impl Aim {
@@ -605,7 +573,7 @@ impl Aim {
             self.yielded += u32::from(hand_wins);
         }
 
-        self.reason = match self.aim_at(active, held, me, players, angles, hand_wins) {
+        let reason = match self.aim_at(active, held, me, players, angles, hand_wins) {
             Err(refusal) => refusal,
             Ok(counts) => {
                 if input::move_by(counts[0], counts[1]) {
@@ -618,6 +586,17 @@ impl Aim {
                 }
             }
         };
+        self.reason = reason;
+        self.tally[reason as usize] += 1;
+    }
+
+    /// Every refusal and how often it has happened, zeros included.
+    fn tally(&self) -> String {
+        Refusal::ALL
+            .iter()
+            .fold("aim tally".to_owned(), |line, refusal| {
+                line + &format!(" {}={}", refusal.key(), self.tally[*refusal as usize])
+            })
     }
 
     /// The decision, with every way of declining to make one named.
