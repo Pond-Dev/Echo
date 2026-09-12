@@ -426,8 +426,16 @@ struct Nudge {
     sent: i64,
     /// Sends Windows would not accept. Elevation exists to keep this at zero.
     refused: u64,
-    /// Where the view was pointing when the key went down, and the turn since.
-    from: ViewAngles,
+    /// Where the view was pointing at the previous send.
+    previous: ViewAngles,
+    /// The whole turn since the key went down, added up a frame at a time.
+    ///
+    /// Not the difference between where the view started and where it is now.
+    /// Two angles cannot tell a turn of 11 degrees from one of 371, and a log
+    /// recorded exactly that: 3976 counts sent, 11 degrees reported, when the
+    /// counts before it had bought a degree every thirty. One frame's step is
+    /// far too small to be mistaken for a longer one, so adding the steps up
+    /// has no such ceiling.
     turned: f32,
 }
 
@@ -438,7 +446,7 @@ impl Default for Nudge {
             blocked: false,
             sent: 0,
             refused: 0,
-            from: ViewAngles {
+            previous: ViewAngles {
                 pitch: 0.0,
                 yaw: 0.0,
             },
@@ -453,29 +461,35 @@ impl Nudge {
         self.blocked = down && !allowed;
         let sending = down && allowed;
 
+        let now = ViewAngles { pitch: 0.0, yaw };
         // Each hold is measured on its own. Carrying the totals across holds
         // would leave the turn figure describing several presses at once, so
         // a run of small holds would read as one large one.
         if sending && !self.sending {
-            self.from = ViewAngles { pitch: 0.0, yaw };
             self.sent = 0;
             self.turned = 0.0;
+            // No step on the first frame: there is no earlier reading to
+            // measure one against, and the last hold's would credit this one
+            // with whatever the player did in between.
+            self.previous = now;
         }
         self.sending = sending;
         if !sending {
             return;
         }
 
+        // Added before this frame's send rather than after it, because what
+        // has moved the view so far is every send before this one. Crediting
+        // a turn to a movement the game has not seen yet would be the readout
+        // agreeing with itself.
+        self.turned += now.turn_from(self.previous);
+        self.previous = now;
+
         if input::move_by(NUDGE, 0) {
             self.sent += i64::from(NUDGE);
         } else {
             self.refused += 1;
         }
-        // Measured against the yaw read *before* this send, so the figure is
-        // one frame behind what was asked for. Which is honest: the game has
-        // not run a frame yet, and crediting a turn to a movement it has not
-        // seen would be the readout agreeing with itself.
-        self.turned = ViewAngles { pitch: 0.0, yaw }.turn_from(self.from);
     }
 
     fn describe(&self) -> String {
@@ -484,8 +498,16 @@ impl Nudge {
             (_, true) => "held, but the game is not in front",
             _ => "idle",
         };
+        // The ratio is what the next step needs and what says whether this
+        // one worked: a turn without counts behind it is the player's hand,
+        // and counts without a turn are movement the game never saw.
+        let per_count = if self.sent == 0 {
+            String::new()
+        } else {
+            format!("   {:+.4} deg/count", self.turned / self.sent as f32)
+        };
         format!(
-            "nudge {state}   sent {} counts   turned {:+.1} deg{}",
+            "nudge {state}   sent {} counts   turned {:+.1} deg{per_count}{}",
             self.sent,
             self.turned,
             if self.refused > 0 {

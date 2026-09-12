@@ -295,13 +295,20 @@ impl ViewAngles {
     }
 
     /// How far the yaw swung from an earlier reading to this one, the short
-    /// way round. Positive is the direction a rightward movement turns.
+    /// way round. Negative is rightward: the engine counts yaw anticlockwise,
+    /// so moving the mouse right makes it fall.
     ///
     /// Subtracting the two directly is wrong at one place on the compass: yaw
     /// is normalised into half a turn either way, so a one-degree swing that
     /// happens to cross that seam subtracts into nearly a whole circle. The
     /// reading would be right everywhere a player happens to test it and
     /// wrong in one direction on the map.
+    ///
+    /// Only good for swings under half a turn — which is what "the short way
+    /// round" means, and is not a limitation that can be lifted from two
+    /// angles alone. A view that spun 371 degrees and one that moved 11 are
+    /// the same two readings. Anything measuring a longer movement has to add
+    /// up the steps as they happen.
     pub fn turn_from(self, earlier: Self) -> f32 {
         (self.yaw - earlier.yaw + 540.0).rem_euclid(360.0) - 180.0
     }
