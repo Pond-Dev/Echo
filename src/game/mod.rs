@@ -105,6 +105,43 @@ impl Game {
         Ok(Some(LocalPlayer { pawn, health, team }))
     }
 
+    /// What the gun has done to the aim, and how many rounds are behind it.
+    ///
+    /// Two readings rather than one because they answer different questions
+    /// and only make sense together: the punch says how far off the shot will
+    /// be, and the count says whether the trigger has been held since the
+    /// last time anyone looked.
+    ///
+    /// `None` for the same reasons following any pointer into a pawn gives
+    /// none — the round ended, the player died, the object moved between the
+    /// two reads. Ordinary, and not a fault.
+    pub fn aim_punch(&self, pawn: usize) -> windows::core::Result<Option<(Punch, i32)>> {
+        let Some(services) = self
+            .process
+            .read_pointer(pawn + offsets::pawn::AIM_PUNCH_SERVICES)?
+        else {
+            return Ok(None);
+        };
+        let mut bytes = [0u8; 8];
+        if self
+            .process
+            .read(services + offsets::aim_punch::ANGLE, &mut bytes)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let Ok(shots) = self.process.read_i32(pawn + offsets::pawn::SHOTS_FIRED) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            Punch {
+                pitch: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                yaw: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            },
+            shots,
+        )))
+    }
+
     /// Every connected player the game will tell us about.
     ///
     /// Nothing is cached between calls. The entity table moves under us — a
@@ -273,6 +310,40 @@ impl Player {
     }
 }
 
+/// How far the gun has thrown the aim away from where the view is pointing.
+///
+/// Degrees, as the engine stores them: pitch positive downwards. A gun
+/// kicking upwards therefore reads as pitch going negative.
+///
+/// This is not part of the view angle. The view angle is where the player
+/// pointed; the punch is what the weapon added on top, and where a shot
+/// actually goes is the two together. Which is why compensating means moving
+/// the view by the opposite of it, and why a log of the view angle alone
+/// during a spray looks perfectly steady while the bullets climb.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Punch {
+    pub pitch: f32,
+    pub yaw: f32,
+}
+
+impl Punch {
+    /// Whether this could be a real punch at all.
+    ///
+    /// No weapon in the game throws the aim further than this. A reading
+    /// outside it is a pointer that led somewhere else, which is what a stale
+    /// offset looks like from here.
+    pub fn plausible(self) -> bool {
+        self.pitch.is_finite()
+            && self.yaw.is_finite()
+            && self.pitch.abs() <= 45.0
+            && self.yaw.abs() <= 45.0
+    }
+
+    pub fn size(self) -> f32 {
+        self.pitch.hypot(self.yaw)
+    }
+}
+
 /// Health somebody lost between two readings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Damage {
@@ -395,7 +466,39 @@ impl LocalPlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Damage, LocalPlayer, Player, Team, ViewAngles, damage_between};
+    use super::{Damage, LocalPlayer, Player, Punch, Team, ViewAngles, damage_between};
+
+    #[test]
+    fn a_punch_no_weapon_could_produce_is_not_a_punch() {
+        assert!(
+            Punch {
+                pitch: -6.0,
+                yaw: 1.5
+            }
+            .plausible()
+        );
+        assert!(Punch::default().plausible(), "nothing fired yet");
+        for wrong in [
+            Punch {
+                pitch: f32::NAN,
+                yaw: 0.0,
+            },
+            Punch {
+                pitch: 0.0,
+                yaw: f32::INFINITY,
+            },
+            Punch {
+                pitch: -900.0,
+                yaw: 0.0,
+            },
+            Punch {
+                pitch: 0.0,
+                yaw: 120.0,
+            },
+        ] {
+            assert!(!wrong.plausible(), "{wrong:?}");
+        }
+    }
 
     fn standing(pawn: usize, health: i32) -> Player {
         Player {

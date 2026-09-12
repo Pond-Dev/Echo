@@ -61,6 +61,36 @@ pub mod entity {
     pub const SCENE_NODE: usize = schemas::C_BaseEntity::m_pGameSceneNode;
 }
 
+/// Field positions inside our own pawn.
+pub mod pawn {
+    use super::schemas;
+
+    /// Pointer to the object holding what the gun has done to the aim.
+    ///
+    /// The aim punch, not the view punch. Two things called a punch exist and
+    /// they are not the same: one is where the shot goes and the other is
+    /// where the camera is thrown, and compensating for the second would
+    /// leave the bullets where they were.
+    pub const AIM_PUNCH_SERVICES: usize = schemas::C_CSPlayerPawn::m_pAimPunchServices;
+
+    /// Rounds fired without letting go of the trigger. `i32`, back to nought
+    /// on release.
+    pub const SHOTS_FIRED: usize = schemas::C_CSPlayerPawn::m_iShotsFired;
+}
+
+/// Field positions inside the aim punch object.
+pub mod aim_punch {
+    use super::schemas;
+
+    /// How far the gun has thrown the aim, as three `f32` — pitch, yaw, roll.
+    ///
+    /// The game keeps this as a base taken at a tick plus a velocity, and
+    /// what is read here is the base. Whether that is close enough to the
+    /// punch as it stands is a question for a log, which is why the first
+    /// thing built on it only writes it down.
+    pub const ANGLE: usize = schemas::CCSPlayer_AimPunchServices::m_predictableBaseAngle;
+}
+
 /// Field positions inside a player controller — the persistent object for a
 /// connected player, as opposed to the pawn it currently drives.
 pub mod controller {

@@ -38,7 +38,7 @@
 use std::time::{Duration, Instant};
 
 use crate::aim::{Grip, Offset, RAMP, Refusal, STEERING, Situation};
-use crate::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix, damage_between};
+use crate::game::{Game, LocalPlayer, Player, Punch, Team, ViewAngles, ViewMatrix, damage_between};
 use crate::input::{self, RawMouse};
 use crate::log::Log;
 use crate::overlay::{FrameCost, Overlay, rgb};
@@ -179,6 +179,7 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
     // knowing that the key deliberately throws away.
     let mut before: Vec<Player> = Vec::new();
     let mut landed: Option<Instant> = None;
+    let mut last_punch: Option<(Punch, i32)> = None;
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -243,6 +244,13 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
         // towards where the target was relative to where the view was, and
         // those are two different moments.
         let angles = Stages::time(&mut stages.angles, || game.view_angles())?;
+        // Read, written down, and acted on by nothing. The step that
+        // compensates for it comes after this one has been seen to work,
+        // because a controller built on a reading nobody has checked moves
+        // the mouse according to whatever the reading happens to be.
+        let punch = Stages::time(&mut stages.punch, || {
+            me.map_or(Ok(None), |me| game.aim_punch(me.pawn))
+        })?;
         // Focus is a guard, not a preference. With the game behind something
         // else, the same counts drag the pointer across whatever is in front.
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
@@ -276,6 +284,36 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
         if aim.just_delivered {
             landed = Some(started);
         }
+
+        // Only when it changes, and only in the shapes worth a line: a punch
+        // that is plainly not one, the trigger going down, and the kick
+        // growing. A spray is thirty shots and a decay between each of them,
+        // and writing every reading would bury the file the way the aim line
+        // once did.
+        Stages::time(&mut stages.log, || {
+            if let Some((now, shots)) = punch {
+                let (was, was_shots) = last_punch.unwrap_or_default();
+                let worth_saying = !now.plausible()
+                    || (shots > 0 && was_shots == 0)
+                    || (now.size() - was.size()).abs() > 0.15;
+                if worth_saying {
+                    log.record(&format!(
+                        "punch pitch {:+.3} yaw {:+.3} ({:.3} deg)   shot {shots}{}",
+                        now.pitch,
+                        now.yaw,
+                        now.size(),
+                        if now.plausible() {
+                            ""
+                        } else {
+                            "   IMPLAUSIBLE — stale offsets?"
+                        }
+                    ));
+                }
+                last_punch = Some((now, shots));
+            } else {
+                last_punch = None;
+            }
+        });
 
         // What the whole thing is for, and the only line in the file that
         // says so. Everything else here is a stand-in — degrees off, how firm
@@ -390,6 +428,8 @@ struct Stages {
     hand: Duration,
     /// Reading the view angle, which is this step's evidence.
     angles: Duration,
+    /// Reading what the gun has done to the aim.
+    punch: Duration,
     /// Choosing a target and sending the movement. Named separately from
     /// everything else because it is the one stage whose effect leaves this
     /// process.
@@ -439,7 +479,7 @@ impl Stages {
     /// is then measured against a frame that is too short, so they all read
     /// high, and the missing one reads as more than the whole frame. The log
     /// printed `read hand 3.183 ms 228.1%` before this was one list.
-    fn rows(self) -> [(&'static str, Duration); 10] {
+    fn rows(self) -> [(&'static str, Duration); 11] {
         [
             ("read players", self.players),
             ("draw overlay", self.overlay),
@@ -448,6 +488,7 @@ impl Stages {
             ("write log", self.log),
             ("read hand", self.hand),
             ("read angles", self.angles),
+            ("read punch", self.punch),
             ("steer", self.steer),
             ("pump messages", self.pump),
             ("follow window", self.follow),
