@@ -282,6 +282,12 @@ impl Overlay {
         }))
     }
 
+    /// The overlay's own window, for anything that has to be told where to
+    /// deliver messages.
+    pub const fn window(&self) -> HWND {
+        self.window
+    }
+
     pub const fn bounds(&self) -> Bounds {
         self.bounds
     }

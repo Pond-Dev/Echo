@@ -1,20 +1,22 @@
-//! Echo — step 6: draw boxes on the enemies.
+//! Echo — step 7: read the player's own mouse.
 //!
-//! The first thing here that is actually useful. Steps one to four found out
-//! where players are in the world; step five put a window over the game. This
-//! joins them with the matrix the game renders with, so a place in the world
-//! becomes a place on the screen.
+//! Six steps of reading the game end here; this reads the hand. Not where the
+//! cursor is — Windows moves that through acceleration and stops it at the
+//! screen edge, and a game reads neither — but the counts the device itself
+//! reports.
 //!
-//! Every stage of that can refuse: no side to compare against, no position
-//! read this pass, a player behind the camera. Each one skips the box rather
-//! than guessing at it — a box drawn on a teammate is worse than no box.
+//! Nothing acts on them yet. What they are for is the principle the whole
+//! product is built on: a tool that yields to the player has to know what the
+//! player did, separately from what it did itself. That comparison is step
+//! nine, and it is impossible without this.
 //!
-//! The check is your eyes: boxes should sit on enemies, follow them as they
-//! move, shrink with distance, and never appear on your own team.
+//! The check is your hand: move the mouse and the counts move with it, in the
+//! same direction, while the game still has focus.
 
 use std::time::{Duration, Instant};
 
 use echo::game::{Game, LocalPlayer, Player, Team, ViewMatrix};
+use echo::input::RawMouse;
 use echo::log::Log;
 use echo::overlay::{FrameCost, Overlay, rgb};
 use echo::process::AttachError;
@@ -69,6 +71,8 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     // forever with nothing on screen.
     let mut overlay: Option<Overlay> = None;
     let mut next_attach = Instant::now();
+    // Bound to the overlay's window, so it is created and dropped with it.
+    let mut mouse: Option<RawMouse> = None;
 
     let mut last_logged = None;
     let mut next_pace = Instant::now();
@@ -95,20 +99,41 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         if overlay.as_ref().is_some_and(|o| !o.target_is_alive()) {
             log.record("game window gone — dropping the overlay");
             overlay = None;
+            mouse = None;
         }
         if overlay.is_none() && started >= next_attach {
             overlay = Overlay::over(GAME_WINDOW)?;
             match &overlay {
-                Some(overlay) => log.record(&format!("overlay over {:?}", overlay.bounds())),
+                Some(new) => {
+                    log.record(&format!("overlay over {:?}", new.bounds()));
+                    // Raw input is delivered to a window, so it can only be
+                    // asked for once there is one.
+                    mouse = match RawMouse::listen(new.window()) {
+                        Ok(mouse) => Some(mouse),
+                        Err(error) => {
+                            log.record(&format!("no raw mouse: {error}"));
+                            None
+                        }
+                    };
+                }
                 None => next_attach = started + ATTACH_RETRY,
             }
         }
+
+        // Drained before the overlay's pump, which would otherwise take these
+        // messages out of the queue and throw them away.
+        let hand = Stages::time(&mut stages.hand, || {
+            mouse.as_mut().map_or([0; 2], |mouse| {
+                mouse.poll();
+                mouse.take()
+            })
+        });
 
         if let Some(overlay) = overlay.as_mut() {
             Stages::time(&mut stages.pump, || overlay.pump());
             Stages::time(&mut stages.follow, || overlay.follow_target());
             stages.drawing = Stages::time(&mut stages.overlay, || {
-                draw_overlay(overlay, view, me, &players, pace)
+                draw_overlay(overlay, view, me, &players, pace, hand, mouse.as_ref())
             });
         }
         stages.reads = game.take_reads();
@@ -164,6 +189,8 @@ struct Stages {
     /// the frame, and the one part of the loop still unaccounted for when the
     /// stages added up to far less than the frame did.
     log: Duration,
+    /// Reading the player's own mouse.
+    hand: Duration,
     /// Reading the overlay's own message queue.
     pump: Duration,
     /// Keeping the overlay over the game and on top of it. Asks the window
@@ -204,6 +231,7 @@ impl Stages {
             ("read matrix", self.matrix),
             ("read me", self.me),
             ("write log", self.log),
+            ("read hand", self.hand),
             ("pump messages", self.pump),
             ("follow window", self.follow),
         ];
@@ -333,6 +361,8 @@ fn draw_overlay(
     me: Option<LocalPlayer>,
     players: &[Player],
     pace: Pace,
+    hand: [i64; 2],
+    mouse: Option<&RawMouse>,
 ) -> FrameCost {
     let bounds = overlay.bounds();
     overlay.frame(|canvas| {
@@ -381,6 +411,20 @@ fn draw_overlay(
             format!("{} health {}", me.team.label(), me.health),
             format!("{drawn} enemies on screen of {}", players.len()),
             pace.describe(),
+            match mouse {
+                Some(mouse) => format!(
+                    "hand {:>6} {:>6}   {} packets{}",
+                    hand[0],
+                    hand[1],
+                    mouse.packets(),
+                    if mouse.absolute() > 0 {
+                        format!("   {} absolute — unreadable device", mouse.absolute())
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => "no raw mouse".to_owned(),
+            },
         ];
         // Readings that failed their check are called out rather than being
         // silently skipped: a count that climbs is what a game update looks
@@ -389,7 +433,7 @@ fn draw_overlay(
             status.push(format!("{rejected} implausible — stale offsets?"));
         }
         for (row, line) in status.iter().enumerate() {
-            let colour = if row == 4 { WARN } else { TEXT };
+            let colour = if row >= 5 { WARN } else { TEXT };
             canvas.text(12, 12 + row as i32 * 18, line, colour);
         }
     })
