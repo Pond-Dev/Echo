@@ -70,11 +70,17 @@ impl RawMouse {
         })
     }
 
-    /// Drain whatever the device has sent since the last call.
+    /// Drain whatever the device has sent since the last call, and say how
+    /// many packets that was.
     ///
     /// Takes only its own messages out of the queue, so the overlay's pump can
     /// go on handling the rest without either having to know about the other.
-    pub fn poll(&mut self) {
+    ///
+    /// The count is returned rather than only accumulated because what this
+    /// costs per frame is a number of packets times a cost each, and a total
+    /// since startup cannot separate the two.
+    pub fn poll(&mut self) -> u32 {
+        let drained = self.packets;
         let mut message = MSG::default();
         // A bounded drain. An unbounded one would let a flood of packets hold
         // the frame open indefinitely, and a mouse cannot outrun this in the
@@ -90,10 +96,13 @@ impl RawMouse {
                 )
             };
             if !waiting.as_bool() {
-                return;
+                break;
             }
             self.absorb(HRAWINPUT(message.lParam.0 as *mut _));
         }
+        // Packets we could not read are not counted by `absorb`, so this is
+        // what arrived and was understood, not what the queue held.
+        (self.packets - drained) as u32
     }
 
     fn absorb(&mut self, handle: HRAWINPUT) {

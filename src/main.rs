@@ -138,12 +138,13 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
 
         // Drained before the overlay's pump, which would otherwise take these
         // messages out of the queue and throw them away.
-        let hand = Stages::time(&mut stages.hand, || {
-            mouse.as_mut().map_or([0; 2], |mouse| {
-                mouse.poll();
-                mouse.take()
+        let (hand, packets) = Stages::time(&mut stages.hand, || {
+            mouse.as_mut().map_or(([0; 2], 0), |mouse| {
+                let packets = mouse.poll();
+                (mouse.take(), packets)
             })
         });
+        stages.packets = packets;
 
         // Read for this step alone, and read here rather than with the others
         // because it is measured against a movement sent a moment later.
@@ -151,7 +152,15 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // Focus is a guard, not a preference. With the game behind something
         // else, the same counts drag the pointer across whatever is in front.
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
+        let before = (nudge.sending, nudge.blocked);
         Stages::time(&mut stages.nudge, || nudge.send(allowed, angles.yaw));
+        // Both edges of a hold, and nothing in between. The start says where
+        // the view was pointing and the end says what the counts bought —
+        // which is this step's whole evidence, and a readout on a screen that
+        // has since been closed cannot be asked about it afterwards.
+        if (nudge.sending, nudge.blocked) != before {
+            log.record(&nudge.describe());
+        }
 
         if let Some(overlay) = overlay.as_mut() {
             Stages::time(&mut stages.pump, || overlay.pump());
@@ -241,6 +250,11 @@ struct Stages {
     /// another process, and a stage can be slow either by doing expensive work
     /// or by doing many cheap reads.
     reads: u64,
+    /// Mouse packets drained this frame. Reading the hand is the worst frame's
+    /// largest stage more often than anything else, and without this there is
+    /// no telling a flood of packets from a slow packet from a frame that was
+    /// simply descheduled while it happened to be in there.
+    packets: u32,
     /// What the overlay's own time went on. `overlay` above is one number for
     /// the whole of it, which is exactly as useful as one number for the whole
     /// frame was.
@@ -256,24 +270,16 @@ impl Stages {
         value
     }
 
-    fn total(self) -> Duration {
-        self.me
-            + self.players
-            + self.matrix
-            + self.angles
-            + self.nudge
-            + self.overlay
-            + self.pump
-            + self.follow
-            + self.log
-    }
-
-    /// One line per stage, worst first, with its share of the frame. Sorted so
-    /// the line that matters is the one at the top rather than the one whose
-    /// name comes first alphabetically.
-    fn breakdown(self) -> Vec<String> {
-        let total = self.total().as_secs_f64().max(1e-9);
-        let mut rows = [
+    /// Every stage, named. The one place a stage is listed.
+    ///
+    /// The total and the breakdown are both taken from here, because they were
+    /// once two lists and one of them was missing an entry. A stage left out
+    /// of the total is not simply absent from a sum: every other stage's share
+    /// is then measured against a frame that is too short, so they all read
+    /// high, and the missing one reads as more than the whole frame. The log
+    /// printed `read hand 3.183 ms 228.1%` before this was one list.
+    fn rows(self) -> [(&'static str, Duration); 10] {
+        [
             ("read players", self.players),
             ("draw overlay", self.overlay),
             ("read matrix", self.matrix),
@@ -284,14 +290,27 @@ impl Stages {
             ("send nudge", self.nudge),
             ("pump messages", self.pump),
             ("follow window", self.follow),
-        ];
+        ]
+    }
+
+    fn total(self) -> Duration {
+        self.rows().iter().map(|(_, took)| *took).sum()
+    }
+
+    /// One line per stage, worst first, with its share of the frame. Sorted so
+    /// the line that matters is the one at the top rather than the one whose
+    /// name comes first alphabetically.
+    fn breakdown(self) -> Vec<String> {
+        let total = self.total().as_secs_f64().max(1e-9);
+        let mut rows = self.rows();
         rows.sort_by_key(|(_, took)| std::cmp::Reverse(*took));
 
         let mut lines = vec![format!(
-            "  {:<14} {:>7.3} ms   {} reads",
+            "  {:<14} {:>7.3} ms   {} reads   {} packets",
             "stages total",
             total * 1000.0,
-            self.reads
+            self.reads,
+            self.packets
         )];
         lines.extend(rows.iter().map(|(name, took)| {
             let ms = took.as_secs_f64() * 1000.0;
