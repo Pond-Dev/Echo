@@ -1,22 +1,25 @@
-//! Echo — step 3: follow a pointer into the game.
+//! Echo — step 4: walk the entity table and find the other players.
 //!
-//! Step 2 read a value at a fixed offset. This one reads a *pointer* at a
-//! fixed offset and then reads through it, which is how everything else in
-//! the game is reached. The pointer is null whenever there is no pawn — the
-//! main menu, between rounds, spectating — and that is an ordinary state
-//! rather than a failure, so the first real fail-closed decision lives here.
+//! Steps two and three read one value and then one pointer. This walks a
+//! table: sixty-four controller slots, each holding a handle to the pawn that
+//! player is currently driving, each pawn reached through a chunk table. Most
+//! slots are empty, most handles name nothing, and both are ordinary.
 //!
-//! The check is the game: health tracks what the HUD shows, and disappears
-//! when the pawn does.
+//! Nothing is cached between passes. Step three's log showed a pawn address
+//! changing three times across one death and respawn, so every pass re-reads
+//! the chunk pointers as well as the entities in them.
+//!
+//! The check is the scoreboard: the players listed here, their sides and their
+//! health should match it.
 
-use std::io::Write;
 use std::time::Duration;
 
-use echo::game::{Game, LocalPlayer, ViewAngles};
+use echo::console::Screen;
+use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles};
 use echo::log::Log;
 use echo::process::AttachError;
 
-const POLL: Duration = Duration::from_millis(50);
+const POLL: Duration = Duration::from_millis(100);
 
 fn main() {
     let mut log = Log::create();
@@ -25,7 +28,8 @@ fn main() {
     }
 
     if let Err(error) = run(&mut log) {
-        log.say(&format!("\nFailed: {error}"));
+        println!("\nFailed: {error}");
+        log.record(&format!("failed: {error}"));
     }
     wait_before_closing();
 }
@@ -37,81 +41,180 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     };
 
     let client = game.client();
-    log.say(&format!("cs2.exe      pid={}", game.pid()));
-    log.say(&format!(
-        "client.dll   base=0x{:X}  size={} bytes",
+    log.record(&format!("cs2.exe pid={}", game.pid()));
+    log.record(&format!(
+        "client.dll base=0x{:X} size={}",
         client.base, client.size
     ));
 
     if !game.client_looks_like_a_module()? {
-        log.say("\nNo PE signature at the module base — attached to the wrong thing.");
+        log.say("No PE signature at the module base — attached to the wrong thing.");
         return Ok(());
     }
 
-    log.say("\nMove your mouse and take some damage — both should follow.");
-    log.say("Ctrl+C to stop.\n");
-
-    let mut stdout = std::io::stdout();
+    let screen = Screen::new();
     let mut last_logged = None;
     loop {
-        let reading = (game.view_angles()?, game.local_player()?);
+        let angles = game.view_angles()?;
+        let me = game.local_player()?;
+        let mut players = game.players()?;
+        // Enemies first, then teammates, then everyone else; stable within a
+        // group by slot so the list does not jump around between frames.
+        players.sort_by_key(|player| rank(*player, me));
 
-        print!("\r  {:<70}", describe(reading));
-        let _ = stdout.flush();
+        screen.draw(&frame(&game, angles, me, &players));
 
-        // Only changes are worth a line. A still mouse produces the same
-        // reading twenty times a second, and recording that says the clock is
-        // running, not that anything happened. The console already shows the
-        // loop is alive.
-        if last_logged != Some(reading) {
-            log.record(&record(reading));
-            last_logged = Some(reading);
+        // The log records the roster, not the movement. Fourteen players
+        // walking around change their positions every single pass, and a file
+        // that re-states all of them ten times a second records that the clock
+        // is running. What is worth finding afterwards is who was present, on
+        // which side, and whether they were alive — so that is the key.
+        let roster = roster(me, &players);
+        if last_logged.as_ref() != Some(&roster) {
+            for line in records(me, &players) {
+                log.record(&line);
+            }
+            last_logged = Some(roster);
         }
 
         std::thread::sleep(POLL);
     }
 }
 
-/// One line for the live console readout.
-fn describe((angles, player): (ViewAngles, Option<LocalPlayer>)) -> String {
-    let aim = if angles.plausible() {
-        format!("pitch {:>7.2}   yaw {:>8.2}", angles.pitch, angles.yaw)
-    } else {
-        format!("angles implausible ({} {})", angles.pitch, angles.yaw)
+/// Sort key: enemies, then teammates, then the rest.
+fn rank(player: Player, me: Option<LocalPlayer>) -> (u8, usize) {
+    let group = match me {
+        Some(me) if me.team.opposes(player.team) => 0,
+        Some(me) if me.team == player.team => 1,
+        _ => 2,
     };
-
-    let body = match player {
-        None => "no pawn — menu, between rounds, or spectating".to_owned(),
-        Some(player) if !player.plausible() => {
-            format!("health implausible ({})", player.health)
-        }
-        Some(player) if player.alive() => format!("health {:>4}", player.health),
-        Some(_) => "dead".to_owned(),
-    };
-
-    format!("{aim}   {body}")
+    (group, player.controller)
 }
 
-/// The same reading, shaped for the log: fields rather than prose, so a run
-/// can be scanned or grepped afterwards.
-fn record((angles, player): (ViewAngles, Option<LocalPlayer>)) -> String {
-    let mut line = format!("pitch={:.3} yaw={:.3}", angles.pitch, angles.yaw);
-    if !angles.plausible() {
-        line.push_str(" ANGLES_IMPLAUSIBLE");
+fn frame(
+    game: &Game,
+    angles: ViewAngles,
+    me: Option<LocalPlayer>,
+    players: &[Player],
+) -> Vec<String> {
+    let client = game.client();
+    let mut lines = vec![
+        format!("echo — pid {}   client.dll 0x{:X}", game.pid(), client.base),
+        String::new(),
+    ];
+
+    lines.push(if angles.plausible() {
+        format!(
+            "  view    pitch {:>7.2}   yaw {:>8.2}",
+            angles.pitch, angles.yaw
+        )
+    } else {
+        format!("  view    implausible ({} {})", angles.pitch, angles.yaw)
+    });
+
+    lines.push(match me {
+        None => "  me      no pawn — menu, between rounds, or spectating".to_owned(),
+        Some(me) if !me.plausible() => format!("  me      health implausible ({})", me.health),
+        Some(me) => format!(
+            "  me      {:<4} health {:>4}{}",
+            me.team.label(),
+            me.health,
+            if me.alive() { "" } else { "   dead" }
+        ),
+    });
+
+    lines.push(String::new());
+    if players.is_empty() {
+        lines.push("  no players — not in a server".to_owned());
+        return lines;
     }
-    match player {
-        None => line.push_str(" pawn=none"),
-        Some(player) => {
-            line.push_str(&format!(
-                " pawn=0x{:X} health={}",
-                player.pawn, player.health
-            ));
-            if !player.plausible() {
-                line.push_str(" HEALTH_IMPLAUSIBLE");
+
+    let enemies = players
+        .iter()
+        .filter(|p| me.is_some_and(|me| me.team.opposes(p.team)) && p.alive())
+        .count();
+    lines.push(format!(
+        "  {} players, {enemies} enemies alive",
+        players.len()
+    ));
+    lines.push(String::new());
+    lines.push("  side  health  position                        relation".to_owned());
+    for player in players {
+        lines.push(describe(*player, me));
+    }
+    lines
+}
+
+fn describe(player: Player, me: Option<LocalPlayer>) -> String {
+    let position = match player.origin {
+        Some([x, y, z]) => format!("{x:>9.1} {y:>9.1} {z:>9.1}"),
+        None => "       — no scene node —".to_owned(),
+    };
+    let relation = match me {
+        Some(me) if me.pawn == player.pawn => "me",
+        Some(me) if me.team.opposes(player.team) => "ENEMY",
+        Some(me) if me.team == player.team => "team",
+        _ => "",
+    };
+    let health = if player.plausible() {
+        format!("{:>6}", player.health)
+    } else {
+        format!("{:>6}?", player.health)
+    };
+    format!(
+        "  {:<4}{health}  {position}    {relation}{}",
+        player.team.label(),
+        if player.alive() { "" } else { "  (dead)" }
+    )
+}
+
+/// What makes this pass different from the last one, for the log's purposes.
+///
+/// Positions are deliberately not part of it: they change every pass and
+/// would make every pass "different".
+fn roster(me: Option<LocalPlayer>, players: &[Player]) -> Vec<(usize, Team, i32)> {
+    let mut key: Vec<_> = players
+        .iter()
+        .map(|player| (player.pawn, player.team, player.health))
+        .collect();
+    if let Some(me) = me {
+        key.push((me.pawn, me.team, me.health));
+    }
+    key
+}
+
+/// The same pass, shaped for the log: one line per player, fields not prose.
+fn records(me: Option<LocalPlayer>, players: &[Player]) -> Vec<String> {
+    let mut lines = vec![match me {
+        None => "me=none".to_owned(),
+        Some(me) => format!(
+            "me pawn=0x{:X} team={} health={}",
+            me.pawn,
+            me.team.label(),
+            me.health
+        ),
+    }];
+    for player in players {
+        // Enough precision to tell a real coordinate from a quantised one:
+        // a position that only ever lands on a grid is reading the wrong
+        // field, and rounding to whole units would hide that.
+        let position = player.origin.map_or_else(
+            || "origin=none".to_owned(),
+            |[x, y, z]| format!("x={x:.2} y={y:.2} z={z:.2}"),
+        );
+        lines.push(format!(
+            "  player pawn=0x{:X} team={} health={} {position}{}",
+            player.pawn,
+            player.team.label(),
+            player.health,
+            if player.plausible() {
+                ""
+            } else {
+                " HEALTH_IMPLAUSIBLE"
             }
-        }
+        ));
     }
-    line
+    lines
 }
 
 /// Double-clicking a console binary closes the window the moment it returns,

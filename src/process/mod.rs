@@ -137,6 +137,18 @@ impl Process {
         Ok(f32::from_le_bytes(bytes))
     }
 
+    pub fn read_u8(&self, address: usize) -> windows::core::Result<u8> {
+        let mut bytes = [0u8; 1];
+        self.read(address, &mut bytes)?;
+        Ok(bytes[0])
+    }
+
+    pub fn read_u32(&self, address: usize) -> windows::core::Result<u32> {
+        let mut bytes = [0u8; 4];
+        self.read(address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
     pub fn read_i32(&self, address: usize) -> windows::core::Result<i32> {
         let mut bytes = [0u8; 4];
         self.read(address, &mut bytes)?;

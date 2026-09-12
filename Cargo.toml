@@ -15,4 +15,4 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_Foundation"] }
+windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_Foundation", "Win32_System_Console"] }

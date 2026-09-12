@@ -12,6 +12,7 @@
 //!
 //! A game update therefore reaches exactly one file, `game::offsets`.
 
+pub mod console;
 pub mod game;
 pub mod log;
 pub mod process;

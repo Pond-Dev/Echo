@@ -38,6 +38,10 @@ pub mod module {
     /// Pointer to the local player's pawn. Null whenever there is no pawn —
     /// in the main menu, between rounds, while spectating.
     pub const LOCAL_PLAYER_PAWN: usize = client_dll::dwLocalPlayerPawn;
+
+    /// Pointer to the entity system, which owns the chunk table every other
+    /// entity is reached through.
+    pub const ENTITY_SYSTEM: usize = client_dll::dwEntityList;
 }
 
 /// Field positions inside an entity, relative to the entity's own address.
@@ -46,4 +50,27 @@ pub mod entity {
 
     /// Current health. `i32`.
     pub const HEALTH: usize = schemas::C_BaseEntity::m_iHealth;
+
+    /// Which side the entity plays for. `u8`.
+    pub const TEAM: usize = schemas::C_BaseEntity::m_iTeamNum;
+
+    /// Pointer to the node holding this entity's place in the world.
+    pub const SCENE_NODE: usize = schemas::C_BaseEntity::m_pGameSceneNode;
+}
+
+/// Field positions inside a player controller — the persistent object for a
+/// connected player, as opposed to the pawn it currently drives.
+pub mod controller {
+    use super::schemas;
+
+    /// Handle to the pawn this player is currently controlling.
+    pub const PAWN_HANDLE: usize = schemas::CCSPlayerController::m_hPlayerPawn;
+}
+
+/// Field positions inside a scene node.
+pub mod scene_node {
+    use super::schemas;
+
+    /// Position in the world: three `f32`.
+    pub const ORIGIN: usize = schemas::CGameSceneNode::m_vecAbsOrigin;
 }

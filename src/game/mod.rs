@@ -5,6 +5,7 @@
 
 use crate::process::{AttachError, Module, Process};
 
+pub mod entities;
 pub mod offsets;
 
 const EXE: &str = "cs2.exe";
@@ -72,7 +73,175 @@ impl Game {
             return Ok(None);
         };
 
-        Ok(Some(LocalPlayer { pawn, health }))
+        let team = Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?);
+        Ok(Some(LocalPlayer { pawn, health, team }))
+    }
+
+    /// Every connected player the game will tell us about.
+    ///
+    /// Nothing is cached between calls. The entity table moves under us — a
+    /// respawn allocates a new pawn at a new address — so every pass re-reads
+    /// the chunk pointers as well as the entities themselves.
+    pub fn players(&self) -> windows::core::Result<Vec<Player>> {
+        let Some(system) = self
+            .process
+            .read_pointer(self.client.base + offsets::module::ENTITY_SYSTEM)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut players = Vec::new();
+        for index in entities::CONTROLLER_INDICES {
+            // An empty slot is the normal case: a server with ten players
+            // leaves fifty-four of these null.
+            let Ok(Some(controller)) = self.entity(system, index) else {
+                continue;
+            };
+            if let Ok(Some(player)) = self.player_from_controller(system, controller) {
+                players.push(player);
+            }
+        }
+        Ok(players)
+    }
+
+    /// Resolve one entity index to its address, through the chunk table.
+    fn entity(&self, system: usize, index: u32) -> windows::core::Result<Option<usize>> {
+        let Some(chunk_pointer) = entities::chunk_pointer(system, index) else {
+            return Ok(None);
+        };
+        let Some(chunk) = self.process.read_pointer(chunk_pointer)? else {
+            return Ok(None);
+        };
+        self.process
+            .read_pointer(chunk + entities::entry_offset(index))
+    }
+
+    /// The pawn a controller is driving, and what it looks like right now.
+    ///
+    /// A controller without a live pawn is a player who is connected but not
+    /// embodied — spectating, or between rounds — which is ordinary.
+    fn player_from_controller(
+        &self,
+        system: usize,
+        controller: usize,
+    ) -> windows::core::Result<Option<Player>> {
+        let handle = self
+            .process
+            .read_u32(controller + offsets::controller::PAWN_HANDLE)?;
+        let Some(index) = entities::handle_index(handle) else {
+            return Ok(None);
+        };
+        let Some(pawn) = self.entity(system, index)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Player {
+            controller,
+            pawn,
+            health: self.process.read_i32(pawn + offsets::entity::HEALTH)?,
+            team: Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?),
+            origin: self.origin_of(pawn)?,
+        }))
+    }
+
+    /// Where an entity stands: the point its feet are on.
+    ///
+    /// Not where its eyes are. The game's own `cl_showpos` reports the eye
+    /// position, which is this plus a view offset — 64 units while standing —
+    /// so the two disagree by that much and both are right. Anything aiming
+    /// at a player will want the eye or a hitbox, not this.
+    fn origin_of(&self, entity: usize) -> windows::core::Result<Option<[f32; 3]>> {
+        let Some(node) = self
+            .process
+            .read_pointer(entity + offsets::entity::SCENE_NODE)?
+        else {
+            return Ok(None);
+        };
+        let mut bytes = [0u8; 12];
+        self.process
+            .read(node + offsets::scene_node::ORIGIN, &mut bytes)?;
+        Ok(Some([
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        ]))
+    }
+}
+
+/// Which side an entity plays for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Team {
+    Unassigned,
+    Spectator,
+    Terrorist,
+    CounterTerrorist,
+    /// Anything the game reports that is none of the above — a stale offset
+    /// reads as this rather than being silently folded into a real side.
+    Unknown(u8),
+}
+
+impl Team {
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Unassigned,
+            1 => Self::Spectator,
+            2 => Self::Terrorist,
+            3 => Self::CounterTerrorist,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether this side actually plays. Spectators and the unassigned are
+    /// never targets, and neither is a team we failed to recognise.
+    pub const fn plays(self) -> bool {
+        matches!(self, Self::Terrorist | Self::CounterTerrorist)
+    }
+
+    /// Whether `self` and `other` are on opposite playing sides.
+    ///
+    /// Spelled out rather than derived from "different team", so that an
+    /// unrecognised side can never be promoted into an enemy: a stale offset
+    /// reads as garbage, and garbage must not become a target.
+    pub const fn opposes(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Terrorist, Self::CounterTerrorist) | (Self::CounterTerrorist, Self::Terrorist)
+        )
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unassigned => "none",
+            Self::Spectator => "spec",
+            Self::Terrorist => "T",
+            Self::CounterTerrorist => "CT",
+            Self::Unknown(_) => "?",
+        }
+    }
+}
+
+/// One connected player, as of this pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Player {
+    /// The persistent object for this player.
+    pub controller: usize,
+    /// The body they are currently driving. Changes on every respawn.
+    pub pawn: usize,
+    pub health: i32,
+    pub team: Team,
+    /// `None` when the scene node could not be reached this pass.
+    pub origin: Option<[f32; 3]>,
+}
+
+impl Player {
+    pub const fn alive(self) -> bool {
+        self.health > 0
+    }
+
+    /// Same bounds as the local player: outside them, the pointer led
+    /// somewhere that is not a pawn.
+    pub const fn plausible(self) -> bool {
+        0 <= self.health && self.health <= 100
     }
 }
 
@@ -104,6 +273,8 @@ pub struct LocalPlayer {
     /// Address of the pawn inside the game, kept for reads that follow.
     pub pawn: usize,
     pub health: i32,
+    /// Which side we are on — the reference every enemy check is made against.
+    pub team: Team,
 }
 
 impl LocalPlayer {
@@ -123,12 +294,13 @@ impl LocalPlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalPlayer, ViewAngles};
+    use super::{LocalPlayer, Team, ViewAngles};
 
     fn player(health: i32) -> LocalPlayer {
         LocalPlayer {
             pawn: 0x1234_5678,
             health,
+            team: Team::CounterTerrorist,
         }
     }
 
@@ -141,6 +313,38 @@ mod tests {
         // Dead is a real state, not a bad reading.
         assert!(player(0).plausible());
         assert!(!player(0).alive());
+    }
+
+    #[test]
+    fn only_the_two_playing_sides_can_ever_be_enemies() {
+        let t = Team::Terrorist;
+        let ct = Team::CounterTerrorist;
+
+        assert!(t.opposes(ct));
+        assert!(ct.opposes(t));
+        assert!(!t.opposes(t), "a teammate is not an enemy");
+
+        // Nothing that is not playing can be on either end of it. This is the
+        // guard that stops a stale offset turning into a target.
+        for bystander in [
+            Team::Unassigned,
+            Team::Spectator,
+            Team::Unknown(7),
+            Team::Unknown(255),
+        ] {
+            assert!(!bystander.plays(), "{bystander:?}");
+            assert!(!bystander.opposes(t), "{bystander:?}");
+            assert!(!t.opposes(bystander), "{bystander:?}");
+            assert!(!bystander.opposes(bystander), "{bystander:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_side_keeps_its_raw_value_instead_of_being_folded_into_a_real_one() {
+        assert_eq!(Team::from_raw(2), Team::Terrorist);
+        assert_eq!(Team::from_raw(3), Team::CounterTerrorist);
+        assert_eq!(Team::from_raw(9), Team::Unknown(9));
+        assert_eq!(Team::from_raw(200), Team::Unknown(200));
     }
 
     #[test]
