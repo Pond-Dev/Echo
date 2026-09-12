@@ -91,9 +91,13 @@ const STEERING: Steering = Steering {
 
 /// How the strength rises and falls.
 ///
-/// Two counts in a pass is around four degrees a second at the sensitivity
-/// this was measured on — under any deliberate adjustment, and above a hand
-/// at rest, which reports nothing whatsoever.
+/// Six counts in a pass is around twelve degrees a second at the sensitivity
+/// this was measured on. It was four, and four is a speed a player reaches
+/// while aiming *with* the assist rather than against it: a session held the
+/// grip between three and fourteen per cent for a whole second of ordinary
+/// play, because the gaps between small corrections were shorter than the
+/// rise and it could never climb out of them. Twelve degrees a second is a
+/// push, not a correction.
 ///
 /// The durations replace what was a plain switch. A session's tally read
 /// `hand=2853 steering=359`: the hand took three passes in four, and not
@@ -101,7 +105,7 @@ const STEERING: Steering = Steering {
 /// because the assist was flickering on and off several times a second.
 /// Nothing about that is visible as a decision — it is felt as a hard edge.
 const RAMP: Ramp = Ramp {
-    moving: 2,
+    moving: 6,
     rise: Duration::from_millis(140),
     fall: Duration::from_millis(120),
 };
