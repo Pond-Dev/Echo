@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use crate::game::ViewAngles;
+use crate::game::{LocalPlayer, Player, ViewAngles};
 
 /// How far the view is from where it should be, on each axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -103,6 +103,18 @@ pub struct Steering {
     /// trades one rounding error for another, every pass, which is a tremble
     /// rather than aim.
     pub deadzone: f32,
+    /// How far above a player's feet their eyes are, standing.
+    ///
+    /// Measured rather than guessed: the game's own position readout and the
+    /// entity's origin differ by exactly this, which is what said the origin
+    /// is feet and the readout is eyes.
+    ///
+    /// ponytail: standing only. A crouched player's eyes are about eighteen
+    /// units lower, which at three hundred units is three and a half degrees
+    /// — far outside the deadzone, so the assist would settle confidently
+    /// onto the air above their head and hold it there. Read the pawn's own
+    /// view offset when that starts to matter.
+    pub eye_height: f32,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
     ///
@@ -152,6 +164,47 @@ fn soften(counts: f32, cap: f32, grip: f32) -> i32 {
     }
     (cap * (counts / cap).tanh() * grip.clamp(0.0, 1.0)).round() as i32
 }
+
+/// The tuned values, kept here rather than in the binary.
+///
+/// Not because a module should own a product's settings, but because the
+/// binary cannot be tested at all: a suite living beside it would pass
+/// identically at any value, which is the same as not checking them. What is
+/// worth checking is not any single figure but the arithmetic between them —
+/// the speed a push has to reach is three constants multiplied together, and
+/// changing one of them silently moves it.
+pub const STEERING: Steering = Steering {
+    counts_per_degree: 51.0,
+    gain: 0.35,
+    // Five degrees a pass, which at this rate is a fast flick and not a spin.
+    // What a reading caught mid-write is allowed to cost. Approached and
+    // never reached, so there is no distance at which the assist stops
+    // accelerating and starts coasting.
+    cap: 250.0,
+    deadzone: 0.15,
+    eye_height: 64.0,
+    cone: 30.0,
+};
+
+/// How the strength rises and falls.
+///
+/// A speed, and not a number of counts in a pass, because counts in a pass
+/// measure the same hand differently on a machine that runs the loop at a
+/// different rate. Nothing under it is ignored either: everything between
+/// nothing and this works against the rise in proportion, and the push that
+/// exactly cancels it is [`Ramp::holding_push`] — about seven degrees a
+/// second here, which is a push rather than a correction.
+///
+/// The durations replace what was once a plain switch. A session's tally read
+/// `hand=2853 steering=359`: the hand took three passes in four, and not
+/// because it was steering the view for three quarters of the time but
+/// because the assist was flickering on and off several times a second.
+/// Nothing about that is visible as a decision — it is felt as a hard edge.
+pub const RAMP: Ramp = Ramp {
+    full_push: 750.0,
+    rise: Duration::from_millis(140),
+    fall: Duration::from_millis(120),
+};
 
 /// How the strength the assist steers with rises and falls.
 #[derive(Clone, Copy, Debug)]
@@ -308,6 +361,148 @@ fn smooth(along: f32) -> f32 {
     along * along * (3.0 - 2.0 * along)
 }
 
+/// Everything one pass knows, as plain values.
+///
+/// Gathered into one thing so the deciding can be done away from the reading:
+/// what the assist does with a situation is then a question with an answer,
+/// asked and checked without a game running. Which the ladder asked for from
+/// the start — the logic that decides something must be testable without
+/// opening the game — and which was not true while it lived in the binary.
+pub struct Situation<'a> {
+    /// Whether the button is down this instant.
+    pub held: bool,
+    /// Whether the game is the window the player is actually in.
+    pub in_front: bool,
+    /// The player's own mouse. `None` when it cannot be read at all, which is
+    /// never the same as a hand that is not moving.
+    pub hand: Option<[i64; 2]>,
+    pub me: Option<LocalPlayer>,
+    pub players: &'a [Player],
+    pub angles: ViewAngles,
+}
+
+/// What the assist decided, and why.
+pub struct Choice {
+    /// The enemy the view was steered towards, if one was chosen. Set even
+    /// when nothing was sent, so a refusal can say who it was about.
+    pub target: Option<usize>,
+    pub offset: Offset,
+    /// The movement to send, or the reason there is none.
+    pub counts: Result<[i32; 2], Refusal>,
+}
+
+impl Steering {
+    /// Where to move the view this pass, or why not to.
+    ///
+    /// `grip` is how firmly the view is being held and `push` how hard the
+    /// hand is working against it — both from the [`Grip`], which is stateful
+    /// and so is kept by the caller across passes.
+    pub fn choose(self, now: &Situation<'_>, grip: f32, push: f32) -> Choice {
+        let mut choice = Choice {
+            target: None,
+            offset: Offset::default(),
+            counts: Err(Refusal::NotHeld),
+        };
+        choice.counts = self.decide(now, grip, push, &mut choice.target, &mut choice.offset);
+        choice
+    }
+
+    fn decide(
+        self,
+        now: &Situation<'_>,
+        grip: f32,
+        push: f32,
+        chosen: &mut Option<usize>,
+        chosen_offset: &mut Offset,
+    ) -> Result<[i32; 2], Refusal> {
+        if !now.held {
+            return Err(Refusal::NotHeld);
+        }
+        if !now.in_front {
+            // The same counts would drag the pointer across whatever window
+            // is in front instead of turning the view.
+            return Err(Refusal::NotInFront);
+        }
+        // Before anything else worth doing. Steering while unable to tell
+        // whether the player is pushing back is the one failure the whole
+        // yielding step exists to prevent, so it is a refusal and not a
+        // fallback to some safe-looking default.
+        if now.hand.is_none() {
+            return Err(Refusal::HandUnreadable);
+        }
+        // Our own side is what every enemy test is made against, so a bad
+        // reading of it would make targets of teammates.
+        let me = now
+            .me
+            .filter(|me| me.plausible())
+            .ok_or(Refusal::NoLocalPlayer)?;
+        // Dead is a real state and a plausible one, and the camera is
+        // somewhere else entirely while it lasts: the origin still read is a
+        // corpse's, the angles are whoever is being watched. Steering between
+        // two unrelated frames of reference drags the spectator camera about.
+        if !me.alive() {
+            return Err(Refusal::NotAlive);
+        }
+        if !now.angles.plausible() {
+            return Err(Refusal::ViewImplausible);
+        }
+        let eye = now
+            .players
+            .iter()
+            .find(|player| player.pawn == me.pawn)
+            .and_then(|player| player.origin)
+            .map(|origin| self.eyes(origin))
+            .ok_or(Refusal::NoPositionForUs)?;
+
+        // The one nearest to where the player is already pointing. Measured
+        // as an angle rather than as a distance on screen, because a target
+        // at the edge of the view is further away than the same gap in pixels
+        // near the middle, and it is the angle the movement has to cover.
+        let (pawn, offset) = now
+            .players
+            .iter()
+            .filter(|player| {
+                player.pawn != me.pawn
+                    && player.plausible()
+                    && me.team.opposes(player.team)
+                    && player.alive()
+            })
+            .filter_map(|player| {
+                let desired = look_at(eye, self.eyes(player.origin?))?;
+                let at = offset(now.angles, desired);
+                self.within_cone(at).then_some((player.pawn, at))
+            })
+            .min_by(|(_, a), (_, b)| a.size().total_cmp(&b.size()))
+            .ok_or(Refusal::NoEnemyInTheCone)?;
+
+        // Recorded before the last refusal rather than after it, so a line
+        // about the player taking the view back can still say which enemy it
+        // was taken from.
+        *chosen = Some(pawn);
+        *chosen_offset = offset;
+
+        self.counts(offset, grip).ok_or({
+            // Nothing to send means three different things, and calling them
+            // all one thing quietly spoiled the count the tuning rests on:
+            // the view is there already, the player has taken it, or the grip
+            // is simply too low yet to round to a movement — which happens on
+            // every rise and has nothing to do with the hand.
+            if offset.size() < self.deadzone {
+                Refusal::AlreadyOnTarget
+            } else if push > 0.0 {
+                Refusal::HandWins
+            } else {
+                Refusal::Easing
+            }
+        })
+    }
+
+    /// A player's eyes, from the feet their origin records.
+    fn eyes(self, origin: [f32; 3]) -> [f32; 3] {
+        [origin[0], origin[1], origin[2] + self.eye_height]
+    }
+}
+
 /// What stopped the view from being steered this pass, if anything did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Refusal {
@@ -428,6 +623,7 @@ impl Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::Team;
 
     fn angles(pitch: f32, yaw: f32) -> ViewAngles {
         ViewAngles { pitch, yaw }
@@ -439,6 +635,7 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
+            eye_height: 64.0,
             cone: 30.0,
         }
     }
@@ -843,6 +1040,220 @@ mod tests {
         // The hand settles, and the assist is all the way there one rise
         // later — late, not absent.
         assert!(ramped(&mut grip, true, 0.0, ramp().rise) > 0.99);
+    }
+
+    fn enemy(pawn: usize, at: [f32; 3]) -> Player {
+        Player {
+            controller: pawn,
+            pawn,
+            team: Team::CounterTerrorist,
+            health: 100,
+            origin: Some(at),
+        }
+    }
+
+    fn us() -> LocalPlayer {
+        LocalPlayer {
+            pawn: 0x1000,
+            health: 100,
+            team: Team::Terrorist,
+        }
+    }
+
+    /// Us at the origin looking east, with whoever else is passed in.
+    fn facing_east(players: &[Player]) -> Vec<Player> {
+        let mut all = vec![Player {
+            controller: us().pawn,
+            pawn: us().pawn,
+            team: us().team,
+            health: us().health,
+            origin: Some([0.0, 0.0, 0.0]),
+        }];
+        all.extend_from_slice(players);
+        all
+    }
+
+    fn situation(players: &[Player]) -> Situation<'_> {
+        Situation {
+            held: true,
+            in_front: true,
+            hand: Some([0, 0]),
+            me: Some(us()),
+            players,
+            angles: ViewAngles {
+                pitch: 0.0,
+                yaw: 0.0,
+            },
+        }
+    }
+
+    /// One way of breaking an otherwise workable pass, and what it should be
+    /// refused as.
+    struct Breakage {
+        expected: Refusal,
+        break_it: Break,
+    }
+
+    /// What breaking one thing about a pass looks like.
+    type Break = fn(&mut Situation<'_>);
+
+    /// Everything the assist refuses over, in the order it refuses.
+    ///
+    /// Each entry breaks one thing about an otherwise workable pass. Kept as
+    /// a list so a new refusal has somewhere obvious to go, and so the order
+    /// is a fact with a test rather than whatever the code happens to do.
+    fn each_way_it_can_refuse() -> Vec<Breakage> {
+        let ways: [(Refusal, Break); 7] = [
+            (Refusal::NotHeld, |now| now.held = false),
+            (Refusal::NotInFront, |now| now.in_front = false),
+            (Refusal::HandUnreadable, |now| now.hand = None),
+            (Refusal::NoLocalPlayer, |now| now.me = None),
+            (Refusal::NotAlive, |now| {
+                now.me = Some(LocalPlayer { health: 0, ..us() });
+            }),
+            (Refusal::ViewImplausible, |now| now.angles.pitch = 400.0),
+            (Refusal::NoPositionForUs, |now| now.players = &[]),
+        ];
+        ways.into_iter()
+            .map(|(expected, break_it)| Breakage { expected, break_it })
+            .collect()
+    }
+
+    #[test]
+    fn a_workable_pass_steers_so_that_breaking_one_thing_means_something() {
+        let players = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+        let choice = STEERING.choose(&situation(&players), 1.0, 0.0);
+        assert_eq!(choice.target, Some(0x2000));
+        assert!(choice.counts.is_ok(), "{:?}", choice.counts);
+    }
+
+    #[test]
+    fn every_refusal_that_can_be_provoked_names_itself() {
+        let players = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+        for way in each_way_it_can_refuse() {
+            let mut now = situation(&players);
+            (way.break_it)(&mut now);
+            assert_eq!(
+                STEERING.choose(&now, 1.0, 0.0).counts,
+                Err(way.expected),
+                "breaking the thing {:?} is about gave something else",
+                way.expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_reached_before_anything_it_would_have_to_trust() {
+        // Order is the point, not merely coverage. Reading our own position
+        // before checking we are alive would take a corpse's; choosing a
+        // target before knowing the hand can be read would steer blind. Break
+        // two things at once and the earlier reason must be the one given.
+        let players = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+        let ways = each_way_it_can_refuse();
+        for (earlier, index) in ways.iter().zip(1..) {
+            for later in &ways[index..] {
+                let mut now = situation(&players);
+                (later.break_it)(&mut now);
+                (earlier.break_it)(&mut now);
+                assert_eq!(
+                    STEERING.choose(&now, 1.0, 0.0).counts,
+                    Err(earlier.expected),
+                    "{:?} should come before {:?}",
+                    earlier.expected,
+                    later.expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nobody_worth_shooting_is_told_apart_from_nobody_at_all() {
+        let mine = Player {
+            team: Team::Terrorist,
+            ..enemy(0x2000, [1000.0, 200.0, 0.0])
+        };
+        let dead = Player {
+            health: 0,
+            ..enemy(0x3000, [1000.0, 0.0, 0.0])
+        };
+        let behind = enemy(0x4000, [-1000.0, 0.0, 0.0]);
+        let unreadable = Player {
+            health: 900,
+            ..enemy(0x5000, [1000.0, 0.0, 0.0])
+        };
+        for player in [mine, dead, behind, unreadable] {
+            let players = facing_east(&[player]);
+            assert_eq!(
+                STEERING.choose(&situation(&players), 1.0, 0.0).counts,
+                Err(Refusal::NoEnemyInTheCone),
+                "{player:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nearest_by_angle_is_chosen_and_not_the_nearest_by_distance() {
+        // Close but wide, against far but nearly straight ahead. The movement
+        // to reach the second is smaller, which is what is being minimised.
+        let close_and_wide = enemy(0x2000, [300.0, 120.0, 0.0]);
+        let far_and_ahead = enemy(0x3000, [4000.0, 60.0, 0.0]);
+        let players = facing_east(&[close_and_wide, far_and_ahead]);
+        let choice = STEERING.choose(&situation(&players), 1.0, 0.0);
+        assert_eq!(choice.target, Some(0x3000));
+    }
+
+    #[test]
+    fn nothing_to_send_says_which_of_the_three_it_was() {
+        // Level with us, so that adding the same eye height to both leaves
+        // the view exactly on them.
+        let dead_ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
+        assert_eq!(
+            STEERING.choose(&situation(&dead_ahead), 1.0, 0.0).counts,
+            Err(Refusal::AlreadyOnTarget),
+            "the view is there already"
+        );
+
+        let off_to_one_side = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+        assert_eq!(
+            STEERING
+                .choose(&situation(&off_to_one_side), 0.0, 1.0)
+                .counts,
+            Err(Refusal::HandWins),
+            "the player has taken it"
+        );
+        assert_eq!(
+            STEERING
+                .choose(&situation(&off_to_one_side), 0.0, 0.0)
+                .counts,
+            Err(Refusal::Easing),
+            "the grip is only on its way up"
+        );
+    }
+
+    #[test]
+    fn the_tuned_values_still_mean_what_they_are_written_down_as_meaning() {
+        // None of these is worth pinning on its own — they are meant to be
+        // turned. What is worth pinning is the arithmetic between them, since
+        // each figure is described in prose by a number none of them holds.
+        let degrees_a_second = RAMP.full_push * STEERING.counts_per_degree.recip();
+        assert!(
+            (10.0..20.0).contains(&degrees_a_second),
+            "a full push is {degrees_a_second:.1} degrees a second, not the \
+             fifteen it is written as"
+        );
+
+        let holding = RAMP.holding_push() * degrees_a_second;
+        assert!(
+            (5.0..9.0).contains(&holding),
+            "the grip holds at {holding:.1} degrees a second, not the seven \
+             it is written as"
+        );
+
+        // A pass at the target rate must not be able to cross the whole ramp,
+        // or the curve is a switch again on a machine like this one.
+        let pass = Duration::from_millis(8).as_secs_f32();
+        assert!(pass < RAMP.rise.as_secs_f32() / 4.0);
+        assert!(pass < RAMP.fall.as_secs_f32() / 4.0);
     }
 
     #[test]

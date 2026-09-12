@@ -31,8 +31,7 @@
 
 use std::time::{Duration, Instant};
 
-use echo::aim;
-use echo::aim::{Grip, Offset, Ramp, Refusal, Steering};
+use echo::aim::{Grip, Offset, RAMP, Refusal, STEERING, Situation};
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
@@ -69,65 +68,6 @@ const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
 /// goes down, and the one that matters is the one the game is acting on.
 const AIM_KEY: VIRTUAL_KEY = VK_XBUTTON2;
 
-/// How the view is steered.
-///
-/// `counts_per_degree` was measured, not assumed: five holds of about a
-/// thousand counts each, every one landing within a thousandth of 0.0196
-/// degrees a count on the machine it was measured on. That is one player's
-/// sensitivity and not a property of the game, which the feedback loop is
-/// what makes survivable — a share of the remaining distance each pass
-/// arrives wherever the true figure is, only sooner or later.
-const STEERING: Steering = Steering {
-    counts_per_degree: 51.0,
-    gain: 0.35,
-    // Five degrees a pass, which at this rate is a fast flick and not a spin.
-    // What a reading caught mid-write is allowed to cost. Approached and
-    // never reached, so there is no distance at which the assist stops
-    // accelerating and starts coasting.
-    cap: 250.0,
-    deadzone: 0.15,
-    cone: 30.0,
-};
-
-/// How the strength rises and falls.
-///
-/// Seven hundred and fifty counts a second is about fifteen degrees a second
-/// at the sensitivity this was measured on: a push, not a correction. It was
-/// once four degrees a second, and four is a speed a player reaches while
-/// aiming *with* the assist — a session held the grip between three and
-/// fourteen per cent for a whole second of ordinary play, because the gaps
-/// between small corrections were shorter than the rise.
-///
-/// A speed, and not a number of counts in a pass, because counts in a pass
-/// measure the same hand differently on a machine that runs the loop at a
-/// different rate. Nothing under it is ignored either: a hand at a tenth of
-/// it pushes at a tenth of the rate and still ends with the view. A threshold
-/// had a speed below which the player could not take the view back at all,
-/// however long they pushed, which is worse than a slow handover.
-///
-/// The durations replace what was once a plain switch. A session's tally read
-/// `hand=2853 steering=359`: the hand took three passes in four, and not
-/// because it was steering the view for three quarters of the time but
-/// because the assist was flickering on and off several times a second.
-/// Nothing about that is visible as a decision — it is felt as a hard edge.
-const RAMP: Ramp = Ramp {
-    full_push: 750.0,
-    rise: Duration::from_millis(140),
-    fall: Duration::from_millis(120),
-};
-
-/// How far above a player's feet their eyes are, standing.
-///
-/// Measured rather than guessed: the game's own position readout and the
-/// entity's origin differ by exactly this, which is what said the origin is
-/// feet and the readout is eyes. Anything aiming at a player needs the second.
-///
-/// ponytail: standing only. A crouched player's eyes are about eighteen units
-/// lower, which at three hundred units is three and a half degrees — far
-/// outside the deadzone, so the assist would settle confidently onto the air
-/// above their head and hold it there. Read the pawn's own view offset when
-/// that starts to matter.
-const EYE_HEIGHT: f32 = 64.0;
 const ENEMY: COLORREF = rgb(255, 70, 70);
 const TEXT: COLORREF = rgb(235, 235, 235);
 const WARN: COLORREF = rgb(255, 190, 60);
@@ -534,8 +474,10 @@ struct Aim {
     /// rebuilt, because what it knows is where along the ramp it has got to
     /// and that does not belong to any one pass.
     grip: Grip,
-    /// What this pass knew about the player's hand, kept for the readout.
-    hand: HandState,
+    /// Whether the mouse could be read at all this pass. Kept for the
+    /// readout, because a run where it never can is one where nothing works
+    /// and the reason is one line at startup otherwise.
+    hand_readable: bool,
     /// Passes this hold, and how many of them the hand was moving through.
     ///
     /// The share is what says whether the ramp is set anywhere near right. A
@@ -609,17 +551,34 @@ impl Aim {
         // decays to nothing and the next press has to earn it back. Leaving
         // it alone while the button is up would have a second press seize the
         // view at whatever the first one ended on.
-        self.hand = HandState {
-            counts: hand,
-            push,
-            grip: self.grip.update(active, push, elapsed, RAMP),
-        };
+        self.hand_readable = hand.is_some();
+        let grip = self.grip.update(active, push, elapsed, RAMP);
         if active {
             self.passes += 1;
             self.pushed += u32::from(push > 0.0);
         }
 
-        let reason = match self.aim_at(active, held, me, players, angles) {
+        let choice = STEERING.choose(
+            &Situation {
+                held,
+                in_front: allowed,
+                hand,
+                me,
+                players,
+                angles,
+            },
+            grip,
+            push,
+        );
+        // Kept even when nothing was sent, so a line about the player taking
+        // the view back still says which enemy it was taken from — except on
+        // the pass the button comes up, which leaves the last hold's figures
+        // standing because that is the one moment anyone wants them.
+        if held {
+            self.target = choice.target;
+            self.offset = choice.offset;
+        }
+        let reason = match choice.counts {
             Err(refusal) => refusal,
             Ok(counts) => {
                 if input::move_by(counts[0], counts[1]) {
@@ -645,103 +604,6 @@ impl Aim {
             })
     }
 
-    /// The decision, with every way of declining to make one named.
-    ///
-    /// Separated from the sending so that the reasons read as one list rather
-    /// than as a staircase of early returns with the movement at the bottom.
-    fn aim_at(
-        &mut self,
-        active: bool,
-        held: bool,
-        me: Option<LocalPlayer>,
-        players: &[Player],
-        angles: ViewAngles,
-    ) -> Result<[i32; 2], Refusal> {
-        if !active {
-            // Returning before the target is cleared, on purpose: the line
-            // written when the button is let go then still says which enemy
-            // the view was on and how far off it ended, which is the only
-            // moment anyone wants to know it.
-            return Err(if held {
-                Refusal::NotInFront
-            } else {
-                Refusal::NotHeld
-            });
-        }
-        self.target = None;
-        self.offset = Offset::default();
-        // Before anything else worth doing. Steering while unable to tell
-        // whether the player is pushing back is the one failure this whole
-        // step exists to prevent, so it is a refusal and not a fallback.
-        if self.hand.counts.is_none() {
-            return Err(Refusal::HandUnreadable);
-        }
-        // Our own side is what every enemy test is made against, so a bad
-        // reading of it would make targets of teammates.
-        let me = me
-            .filter(|me| me.plausible())
-            .ok_or(Refusal::NoLocalPlayer)?;
-        // Dead is a real state and a plausible one, and the camera is
-        // somewhere else entirely while it lasts: the origin still read is a
-        // corpse's, the angles are whoever is being watched. Steering between
-        // two unrelated frames of reference drags the spectator camera about.
-        if !me.alive() {
-            return Err(Refusal::NotAlive);
-        }
-        if !angles.plausible() {
-            return Err(Refusal::ViewImplausible);
-        }
-        let eye = players
-            .iter()
-            .find(|player| player.pawn == me.pawn)
-            .and_then(|player| player.origin)
-            .map(eyes)
-            .ok_or(Refusal::NoPositionForUs)?;
-
-        // The one nearest to where the player is already pointing. Measured as
-        // an angle rather than as a distance on screen, because a target at
-        // the edge of the view is further away than the same gap in pixels
-        // near the middle, and it is the angle the movement has to cover.
-        let target = players
-            .iter()
-            .filter(|player| {
-                player.pawn != me.pawn
-                    && player.plausible()
-                    && me.team.opposes(player.team)
-                    && player.alive()
-            })
-            .filter_map(|player| {
-                let desired = aim::look_at(eye, eyes(player.origin?))?;
-                let offset = aim::offset(angles, desired);
-                STEERING
-                    .within_cone(offset)
-                    .then_some((player.pawn, offset))
-            })
-            .min_by(|(_, a), (_, b)| a.size().total_cmp(&b.size()));
-
-        let (pawn, offset) = target.ok_or(Refusal::NoEnemyInTheCone)?;
-        self.target = Some(pawn);
-        self.offset = offset;
-        // Last, and after the target is recorded, so the log can say which
-        // enemy the view was on when the player took it back. Refusing before
-        // the search would save the search and lose the reason.
-        STEERING.counts(offset, self.hand.grip).ok_or({
-            // Nothing to send means three different things, and calling them
-            // all the same thing was quietly spoiling the count the whole
-            // tuning of this rests on: the view is there already, the player
-            // has taken it, or the grip is simply too low yet to round to a
-            // movement — which happens on every rise and has nothing at all
-            // to do with the hand.
-            if offset.size() < STEERING.deadzone {
-                Refusal::AlreadyOnTarget
-            } else if self.hand.push > 0.0 {
-                Refusal::HandWins
-            } else {
-                Refusal::Easing
-            }
-        })
-    }
-
     fn describe(&self) -> String {
         let mut line = format!("aim {}", self.reason.label());
         if let Some(pawn) = self.target {
@@ -758,7 +620,7 @@ impl Aim {
         if self.active || self.passes > 0 {
             line += &format!("   grip {:.0}%", self.grip.firmness() * 100.0);
         }
-        if self.hand.counts.is_none() {
+        if !self.hand_readable {
             line += "   no mouse to read";
         }
         if let Some(share) = (self.pushed * 100).checked_div(self.passes) {
@@ -769,25 +631,6 @@ impl Aim {
         }
         line
     }
-}
-
-/// What one pass knew about the player's hand.
-///
-/// Carried together because the three are one reading: how the mouse moved,
-/// what that amounts to as a push, and what the grip became as a result. Any
-/// two of them apart tell a story the third contradicts.
-#[derive(Clone, Copy, Default)]
-struct HandState {
-    /// `None` when the mouse cannot be read at all, which is not the same as
-    /// a hand that is not moving and must never be rounded to it.
-    counts: Option<[i64; 2]>,
-    push: f32,
-    grip: f32,
-}
-
-/// A player's eyes, from the feet their origin records.
-fn eyes(origin: [f32; 3]) -> [f32; 3] {
-    [origin[0], origin[1], origin[2] + EYE_HEIGHT]
 }
 
 /// How tall a standing player is, in world units.
