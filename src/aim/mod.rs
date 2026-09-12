@@ -178,6 +178,19 @@ pub struct Steering {
     /// ponytail: a guess at a fraction of a torso. Replace it with the real
     /// hitbox geometry, which the old product already has.
     pub settle_within: f32,
+    /// How long one press's pull may last before it gives up.
+    ///
+    /// The pull is meant to end once, and arriving was the only thing that
+    /// ended it — so a press whose target stepped behind cover, or whose
+    /// position stopped reading, or that simply never converged, kept
+    /// steering for the whole magazine. On the trigger that is the failure
+    /// this was built not to have: an assist fighting the recoil the player
+    /// is compensating by hand, for thirty bullets.
+    ///
+    /// Generous against what a pull costs — twenty-eight degrees took about
+    /// a hundred and twenty milliseconds — so reaching it means the pull is
+    /// not converging rather than that it needed longer.
+    pub pull_limit: Duration,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
     ///
@@ -246,6 +259,7 @@ pub const STEERING: Steering = Steering {
     cap: 250.0,
     deadzone: 0.15,
     settle_within: 6.0,
+    pull_limit: Duration::from_millis(300),
     eye_height: 64.0,
     aim_height: 55.0,
     cone: 30.0,
@@ -455,6 +469,11 @@ pub struct Situation<'a> {
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
     pub angles: ViewAngles,
+    /// How long the button has been down.
+    ///
+    /// Passed in rather than kept, for the same reason nothing in here is
+    /// told when a press began: it is the caller that knows what a press is.
+    pub pulling_for: Duration,
     /// Who the pull of this press has already been spent on, if anyone.
     ///
     /// Held by the caller because it belongs to the press and not to the
@@ -493,7 +512,7 @@ impl Steering {
     /// `grip` is how firmly the view is being held and `push` how hard the
     /// hand is working against it — both from the [`Grip`], which is stateful
     /// and so is kept by the caller across passes.
-    pub fn choose(self, now: &Situation<'_>, grip: f32, push: f32) -> Choice {
+    pub fn choose(self, now: &Situation<'_>, ramp: Ramp, grip: f32, push: f32) -> Choice {
         let mut choice = Choice {
             target: None,
             offset: Offset::default(),
@@ -501,7 +520,7 @@ impl Steering {
             distance: 0.0,
             counts: Err(Refusal::NotHeld),
         };
-        choice.counts = self.decide(now, grip, push, &mut choice);
+        choice.counts = self.decide(now, ramp, grip, push, &mut choice);
         choice
     }
 
@@ -522,6 +541,7 @@ impl Steering {
     fn decide(
         self,
         now: &Situation<'_>,
+        ramp: Ramp,
         grip: f32,
         push: f32,
         choice: &mut Choice,
@@ -613,6 +633,11 @@ impl Steering {
         if choice.arrived {
             return Err(Refusal::Delivered);
         }
+        // A pull that is not getting there is not going to, and carrying on
+        // means steering through a magazine.
+        if now.pulling_for > self.pull_limit {
+            return Err(Refusal::PullGaveUp);
+        }
 
         self.counts(offset, grip).ok_or({
             // Nothing to send means two different things: the player has
@@ -620,7 +645,13 @@ impl Steering {
             // movement — which happens on every rise and has nothing to do
             // with the hand. Calling them one thing quietly spoiled the count
             // the tuning rests on.
-            if push > 0.0 {
+            //
+            // Measured against the push that actually costs the assist its
+            // grip, not against any push at all. A hand resting on a mouse
+            // emits a count in most passes, and calling that the player
+            // taking the view is the same threshold mistake the grip itself
+            // was built to stop making.
+            if push > ramp.holding_push() {
                 Refusal::HandWins
             } else {
                 Refusal::Easing
@@ -630,13 +661,22 @@ impl Steering {
 
     /// Our own camera, from the feet our origin records.
     fn eyes(self, origin: [f32; 3]) -> [f32; 3] {
-        [origin[0], origin[1], origin[2] + self.eye_height]
+        above(origin, self.eye_height)
     }
 
     /// The place on a target the pull aims at.
     fn aim_point(self, origin: [f32; 3]) -> [f32; 3] {
-        [origin[0], origin[1], origin[2] + self.aim_height]
+        above(origin, self.aim_height)
     }
+}
+
+/// A point this far above a pair of feet.
+///
+/// Shared by both heights so that the one paragraph explaining why they are
+/// two separate figures is not undone by a fix made to one copy of the same
+/// line — reading a crouching player's real offset has to reach both.
+fn above(origin: [f32; 3], height: f32) -> [f32; 3] {
+    [origin[0], origin[1], origin[2] + height]
 }
 
 /// How far apart two places are.
@@ -661,6 +701,7 @@ pub enum Refusal {
     Easing,
     Delivered,
     PullSpent,
+    PullGaveUp,
     WindowsRefused,
     Steering,
 }
@@ -671,7 +712,7 @@ impl Refusal {
     /// Listed rather than derived, and held to the real list by a test: a
     /// reason missing from here would be a reason nothing ever reports, which
     /// is the exact shape of the failure the tally exists to catch.
-    pub const ALL: [Self; Self::COUNT] = [
+    pub const ALL: [Self; 15] = [
         Self::NotHeld,
         Self::NotInFront,
         Self::NoLocalPlayer,
@@ -684,15 +725,13 @@ impl Refusal {
         Self::Easing,
         Self::Delivered,
         Self::PullSpent,
+        Self::PullGaveUp,
         Self::WindowsRefused,
         Self::Steering,
     ];
 
     /// How many there are, for sizing a tally that cannot be indexed past.
-    ///
-    /// Written out rather than taken from the roll call, so that the two have
-    /// to be made to agree instead of one silently following the other.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = Self::ALL.len();
 
     /// Which slot of the tally this one is counted in.
     ///
@@ -715,9 +754,10 @@ impl Refusal {
             Self::HandWins => 8,
             Self::Easing => 9,
             Self::Delivered => 10,
-            Self::PullSpent => 13,
-            Self::WindowsRefused => 11,
-            Self::Steering => 12,
+            Self::PullSpent => 11,
+            Self::PullGaveUp => 12,
+            Self::WindowsRefused => 13,
+            Self::Steering => 14,
         }
     }
 
@@ -736,6 +776,7 @@ impl Refusal {
             Self::HandWins => "hand",
             Self::Delivered => "delivered",
             Self::PullSpent => "pull-spent",
+            Self::PullGaveUp => "pull-gave-up",
             Self::WindowsRefused => "windows-refused",
             Self::Steering => "steering",
         }
@@ -755,6 +796,7 @@ impl Refusal {
             Self::HandWins => "your hand",
             Self::Delivered => "delivered — the rest is yours",
             Self::PullSpent => "this press has had its pull, on someone else",
+            Self::PullGaveUp => "this pull is not getting there — giving it up",
             Self::WindowsRefused => "Windows refused the movement — not elevated?",
             Self::Steering => "steering",
         }
@@ -777,6 +819,7 @@ mod tests {
             cap: 200.0,
             deadzone: 0.2,
             settle_within: 6.0,
+            pull_limit: Duration::from_millis(300),
             eye_height: 64.0,
             aim_height: 55.0,
             cone: 30.0,
@@ -1228,6 +1271,7 @@ mod tests {
                 yaw: 0.0,
             },
             delivered_to: None,
+            pulling_for: Duration::ZERO,
         }
     }
 
@@ -1266,7 +1310,7 @@ mod tests {
     #[test]
     fn a_workable_pass_steers_so_that_breaking_one_thing_means_something() {
         let players = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
-        let choice = STEERING.choose(&situation(&players), 1.0, 0.0);
+        let choice = STEERING.choose(&situation(&players), ramp(), 1.0, 0.0);
         assert_eq!(choice.target, Some(0x2000));
         assert!(choice.counts.is_ok(), "{:?}", choice.counts);
     }
@@ -1278,7 +1322,7 @@ mod tests {
             let mut now = situation(&players);
             (way.break_it)(&mut now);
             assert_eq!(
-                STEERING.choose(&now, 1.0, 0.0).counts,
+                STEERING.choose(&now, ramp(), 1.0, 0.0).counts,
                 Err(way.expected),
                 "breaking the thing {:?} is about gave something else",
                 way.expected
@@ -1300,7 +1344,7 @@ mod tests {
                 (later.break_it)(&mut now);
                 (earlier.break_it)(&mut now);
                 assert_eq!(
-                    STEERING.choose(&now, 1.0, 0.0).counts,
+                    STEERING.choose(&now, ramp(), 1.0, 0.0).counts,
                     Err(earlier.expected),
                     "{:?} should come before {:?}",
                     earlier.expected,
@@ -1328,7 +1372,9 @@ mod tests {
         for player in [mine, dead, behind, unreadable] {
             let players = facing_east(&[player]);
             assert_eq!(
-                STEERING.choose(&situation(&players), 1.0, 0.0).counts,
+                STEERING
+                    .choose(&situation(&players), ramp(), 1.0, 0.0)
+                    .counts,
                 Err(Refusal::NoEnemyInTheCone),
                 "{player:?}"
             );
@@ -1342,7 +1388,7 @@ mod tests {
         let close_and_wide = enemy(0x2000, [300.0, 120.0, 0.0]);
         let far_and_ahead = enemy(0x3000, [4000.0, 60.0, 0.0]);
         let players = facing_east(&[close_and_wide, far_and_ahead]);
-        let choice = STEERING.choose(&situation(&players), 1.0, 0.0);
+        let choice = STEERING.choose(&situation(&players), ramp(), 1.0, 0.0);
         assert_eq!(choice.target, Some(0x3000));
     }
 
@@ -1353,14 +1399,14 @@ mod tests {
         // aims lower than it measures from, so a target on the same floor a
         // thousand units away is half a degree below the crosshair.
         let dead_ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 9.0])]);
-        let choice = STEERING.choose(&situation(&dead_ahead), 1.0, 0.0);
+        let choice = STEERING.choose(&situation(&dead_ahead), ramp(), 1.0, 0.0);
         assert!(choice.arrived);
         assert_eq!(choice.counts, Err(Refusal::Delivered));
 
         // A fifth of a degree off at a thousand units is three units across,
         // which is where the pull is meant to come to rest.
         let nearly = facing_east(&[enemy(0x2000, [1000.0, 3.0, 9.0])]);
-        let choice = STEERING.choose(&situation(&nearly), 1.0, 0.0);
+        let choice = STEERING.choose(&situation(&nearly), ramp(), 1.0, 0.0);
         assert!(choice.arrived, "off by {:.2} deg", choice.offset.size());
     }
 
@@ -1388,12 +1434,12 @@ mod tests {
         let mut now = situation(&walked_off);
         assert!(now.hand.is_some());
         assert!(
-            STEERING.choose(&now, 1.0, 0.0).counts.is_ok(),
+            STEERING.choose(&now, ramp(), 1.0, 0.0).counts.is_ok(),
             "far enough off to be worth a pull"
         );
 
         now.delivered_to = Some(0x2000);
-        let choice = STEERING.choose(&now, 1.0, 0.0);
+        let choice = STEERING.choose(&now, ramp(), 1.0, 0.0);
         assert_eq!(choice.counts, Err(Refusal::Delivered));
         // Still says who, so a line about it can be read afterwards.
         assert_eq!(choice.target, Some(0x2000));
@@ -1404,7 +1450,7 @@ mod tests {
         // a target dying mid-press had it doing, over two hundred units out.
         now.delivered_to = Some(0x9999);
         assert_eq!(
-            STEERING.choose(&now, 1.0, 0.0).counts,
+            STEERING.choose(&now, ramp(), 1.0, 0.0).counts,
             Err(Refusal::PullSpent)
         );
     }
@@ -1414,14 +1460,14 @@ mod tests {
         let off_to_one_side = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
         assert_eq!(
             STEERING
-                .choose(&situation(&off_to_one_side), 0.0, 1.0)
+                .choose(&situation(&off_to_one_side), ramp(), 0.0, 1.0)
                 .counts,
             Err(Refusal::HandWins),
             "the player has taken it"
         );
         assert_eq!(
             STEERING
-                .choose(&situation(&off_to_one_side), 0.0, 0.0)
+                .choose(&situation(&off_to_one_side), ramp(), 0.0, 0.0)
                 .counts,
             Err(Refusal::Easing),
             "the grip is only on its way up"
@@ -1473,7 +1519,6 @@ mod tests {
         // sixty-four, and the pull may come to rest anywhere within
         // `settle_within` of where it aims.
         const HEIGHT: f32 = 72.0;
-        const EYES: f32 = 64.0;
         // The pull comes to rest at that distance rather than staying inside
         // it, so the distance needs room in the torso rather than filling it.
         // Set to a torso's half-width it parks on the outline: a session's
@@ -1490,7 +1535,7 @@ mod tests {
             "and into the ground"
         );
         const _: () = assert!(
-            STEERING.aim_height < EYES,
+            STEERING.aim_height < STEERING.eye_height,
             "aiming at or above the eyes is aiming at the head"
         );
         const _: () = assert!(
@@ -1509,8 +1554,56 @@ mod tests {
         // Level ground, a thousand units away: the pull is downwards, because
         // it aims below its own eye.
         let ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
-        let choice = STEERING.choose(&situation(&ahead), 1.0, 0.0);
+        let choice = STEERING.choose(&situation(&ahead), ramp(), 1.0, 0.0);
         assert!(choice.offset.pitch > 0.0, "{:?}", choice.offset);
+    }
+
+    #[test]
+    fn a_pull_that_is_not_getting_there_is_given_up_rather_than_carried_on() {
+        // On the trigger, a press is a magazine. Arriving was the only thing
+        // that ended a pull, so a target that stepped behind cover left the
+        // assist steering through thirty bullets — fighting the recoil the
+        // player was compensating by hand, which is the failure the whole
+        // design is written around.
+        let far_off = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+
+        let mut now = situation(&far_off);
+        now.pulling_for = STEERING.pull_limit;
+        assert!(
+            STEERING.choose(&now, ramp(), 1.0, 0.0).counts.is_ok(),
+            "still within its time"
+        );
+
+        now.pulling_for = STEERING.pull_limit + Duration::from_millis(1);
+        assert_eq!(
+            STEERING.choose(&now, ramp(), 1.0, 0.0).counts,
+            Err(Refusal::PullGaveUp)
+        );
+    }
+
+    #[test]
+    fn a_hand_the_grip_ignores_is_not_reported_as_the_player_taking_over() {
+        // The grip climbs against any push under its holding point, so a hand
+        // merely resting on a mouse does not take the view. Calling that
+        // `HandWins` put a count in the tally the tuning is read from for
+        // every pass of every rise — the same threshold mistake the grip
+        // itself exists to avoid, made one layer up.
+        let off_target = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
+        let nudging = ramp().holding_push() / 2.0;
+        assert_eq!(
+            STEERING
+                .choose(&situation(&off_target), ramp(), 0.0, nudging)
+                .counts,
+            Err(Refusal::Easing)
+        );
+
+        let shoving = ramp().holding_push() * 1.5;
+        assert_eq!(
+            STEERING
+                .choose(&situation(&off_target), ramp(), 0.0, shoving)
+                .counts,
+            Err(Refusal::HandWins)
+        );
     }
 
     #[test]

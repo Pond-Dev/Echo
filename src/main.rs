@@ -54,6 +54,14 @@ const FRAME: Duration = Duration::from_millis(8);
 const ATTACH_RETRY: Duration = Duration::from_millis(500);
 /// How often the achieved rate is written to the log.
 const PACE_REPORT: Duration = Duration::from_secs(2);
+/// How long after a pull a hit is still credited to it.
+///
+/// Without a limit the first delivery of a session is blamed for every hit
+/// after it, however many minutes later — and `no pull behind it`, which is
+/// the whole control, can never be printed again. A bullet that connects
+/// because of a pull connects within a fraction of a second of one.
+const HIT_WINDOW: Duration = Duration::from_millis(600);
+
 /// How often a hold in progress is written to the log.
 ///
 /// The totals at the end of an eight-second hold cannot say whether the view
@@ -203,16 +211,30 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
         let was = aim.state();
         Stages::time(&mut stages.steer, || {
-            // One pass stale, since the period is closed at the end of a
-            // pass and this is the middle of the next. A few hundred
-            // microseconds against a settle measured in tens of milliseconds.
-            aim.steer(allowed, me, &players, angles, hand, pace.period);
+            aim.steer(
+                allowed,
+                me,
+                &players,
+                angles,
+                Tick {
+                    now: started,
+                    // One pass stale, since the period is closed at the end
+                    // of a pass and this is the middle of the next. A few
+                    // hundred microseconds against ramps measured in tens of
+                    // milliseconds.
+                    elapsed: pace.period,
+                    hand,
+                },
+            );
         });
         // Every change of state, and then every half second while it lasts.
         // A single line at the end of a hold cannot say whether the view
         // walked onto the target or walked away from it.
         if aim.state() != was || (aim.active && started >= next_aim) {
-            log.record(&aim.describe());
+            // Timed, because it is a write into a file in the middle of the
+            // frame. Untimed it was a stage without a name, which is the one
+            // thing the breakdown exists to prevent.
+            Stages::time(&mut stages.log, || log.record(&aim.describe()));
             next_aim = started + AIM_REPORT;
         }
         if aim.just_delivered {
@@ -224,26 +246,35 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // the grip was, how many passes it took — and stand-ins were
         // reporting a session as going well while every shot in it landed on
         // an arm.
-        for hit in damage_between(&before, &players) {
-            let after = landed.map_or_else(
-                || "   no pull behind it".to_owned(),
-                |at| {
-                    format!(
-                        "   {:.0} ms after the pull landed",
-                        at.elapsed().as_secs_f64() * 1000.0
-                    )
-                },
-            );
-            log.record(&format!(
-                "hit 0x{:X} {} -{} ({} -> {}){}{after}",
-                hit.pawn,
-                hit.team.label(),
-                hit.amount(),
-                hit.from,
-                hit.to,
-                if hit.fatal() { "   down" } else { "" },
-            ));
-        }
+        Stages::time(&mut stages.log, || {
+            for hit in damage_between(&before, &players) {
+                // Ours and our own side's are not what this measures. The
+                // roster holds every player including us, so without this the
+                // line that exists to say the assist landed a shot says it
+                // about being shot.
+                if !me.is_some_and(|me| me.team.opposes(hit.team)) {
+                    continue;
+                }
+                let after = landed.filter(|at| at.elapsed() <= HIT_WINDOW).map_or_else(
+                    || "   no pull behind it".to_owned(),
+                    |at| {
+                        format!(
+                            "   {:.0} ms after the pull landed",
+                            at.elapsed().as_secs_f64() * 1000.0
+                        )
+                    },
+                );
+                log.record(&format!(
+                    "hit 0x{:X} {} -{} ({} -> {}){}{after}",
+                    hit.pawn,
+                    hit.team.label(),
+                    hit.amount(),
+                    hit.from,
+                    hit.to,
+                    if hit.fatal() { "   down" } else { "" },
+                ));
+            }
+        });
         before.clear();
         before.extend_from_slice(&players);
 
@@ -502,6 +533,21 @@ impl Pace {
     }
 }
 
+/// What one pass of the loop knows about time and about the mouse.
+///
+/// Carried together because they are one reading of one moment, and because
+/// three more arguments to a method that already has five is how a call comes
+/// to be written in the wrong order without anything noticing.
+#[derive(Clone, Copy)]
+struct Tick {
+    now: Instant,
+    /// Since the previous pass began.
+    elapsed: Duration,
+    /// The player's mouse. `None` when it cannot be read at all, which is
+    /// never the same as a hand that is not moving.
+    hand: Option<[i64; 2]>,
+}
+
 /// Steering the view onto someone while a key is held.
 ///
 /// Holds no reading of its own. Everything it decides from is passed in, so
@@ -529,6 +575,11 @@ struct Aim {
     /// be read as a length on a chest rather than as an angle, which cannot
     /// be read at all without it.
     distance: f32,
+    /// Whether the button is down, regardless of whether anything may come
+    /// of it. What a press is counted from.
+    held: bool,
+    /// When this press began.
+    pressed: Option<Instant>,
     /// Whether the pull finished on this very pass.
     ///
     /// The moment, not the state: the state stays true for the rest of the
@@ -584,22 +635,27 @@ impl Aim {
         me: Option<LocalPlayer>,
         players: &[Player],
         angles: ViewAngles,
-        hand: Option<[i64; 2]>,
-        elapsed: Duration,
+        tick: Tick,
     ) {
+        let Tick { now, elapsed, hand } = tick;
         let held = input::held(AIM_KEY);
         self.blocked = held && !allowed;
         let active = held && allowed;
-        // Each hold counts from zero, so the figures describe this press and
-        // not every press since the program started.
-        if active && !self.active {
+        // Counted from the button rather than from whether the button is
+        // allowed to do anything. A single pass where the game is not the
+        // window in front — one frame of a rebuilt overlay, a blink during an
+        // alt-tab — would otherwise start the press again without it having
+        // been let go of, and hand out a second pull inside one press.
+        if held && !self.held {
             self.sent = [0; 2];
             self.target = None;
             self.offset = Offset::default();
             self.passes = 0;
             self.pushed = 0;
             self.delivered_to = None;
+            self.pressed = Some(now);
         }
+        self.held = held;
         self.active = active;
 
         // A hand nobody can read counts as a hand pushing as hard as it can.
@@ -621,7 +677,11 @@ impl Aim {
             .update(active && self.delivered_to.is_none(), push, elapsed, RAMP);
         if active {
             self.passes += 1;
-            self.pushed += u32::from(push > 0.0);
+            // Against the push that actually costs the assist its grip. Any
+            // push at all is a hand resting on a mouse, and counting that as
+            // the player taking the view made the readout disagree with the
+            // grip printed beside it.
+            self.pushed += u32::from(push > RAMP.holding_push());
         }
 
         let choice = STEERING.choose(
@@ -633,7 +693,9 @@ impl Aim {
                 players,
                 angles,
                 delivered_to: self.delivered_to,
+                pulling_for: self.pressed.map_or(Duration::ZERO, |at| now - at),
             },
+            RAMP,
             grip,
             push,
         );
@@ -686,10 +748,15 @@ impl Aim {
             // the length on a chest that says whether a shot would have
             // landed. An angle on its own says neither.
             let across = self.distance * self.offset.size().to_radians().tan();
+            // The boundary as the pull actually uses it, not the width it is
+            // usually worked out from: past about two thousand units the
+            // tremble floor is wider than the shoulders and takes over, and
+            // printing the width there would show a miss sitting exactly on
+            // the line as though it had sailed past it.
+            let line_at = self.distance * STEERING.handover(self.distance).to_radians().tan();
             line += &format!(
-                "   target 0x{pawn:X}   off {:.2} deg = {across:.0}u of {:.0}u at {:.0}u  (yaw {:+.2} pitch {:+.2})",
+                "   target 0x{pawn:X}   off {:.2} deg = {across:.0}u of {line_at:.0}u at {:.0}u  (yaw {:+.2} pitch {:+.2})",
                 self.offset.size(),
-                STEERING.settle_within,
                 self.distance,
                 self.offset.yaw,
                 self.offset.pitch

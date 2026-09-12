@@ -32,8 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
     GetForegroundWindow, HWND_TOPMOST, IsWindow, LWA_COLORKEY, MSG, PM_REMOVE, PeekMessageW,
     RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetLayeredWindowAttributes,
-    SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    SetWindowPos, ShowWindow, TranslateMessage, WM_INPUT, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -363,12 +363,22 @@ impl Overlay {
     ///
     /// A window that never reads its queue is reported as hung by Windows,
     /// which eventually draws a ghost copy over it.
+    ///
+    /// Everything except the mouse's own. Those belong to whoever reads the
+    /// player's hand, and taking them here meant every packet that arrived
+    /// after that read and before this one was removed and thrown away —
+    /// a share of the player's movement, every frame, silently missing from
+    /// the figure that decides when the assist lets go.
     pub fn pump(&self) {
         let mut message = MSG::default();
         unsafe {
-            while PeekMessageW(&mut message, Some(self.window), 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
+            for (first, last) in [(0, WM_INPUT - 1), (WM_INPUT + 1, u32::MAX)] {
+                while PeekMessageW(&mut message, Some(self.window), first, last, PM_REMOVE)
+                    .as_bool()
+                {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
             }
         }
     }

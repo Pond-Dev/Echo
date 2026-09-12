@@ -302,15 +302,21 @@ impl Damage {
 ///
 /// Only falls count. A reading that climbs is somebody healing or, far more
 /// often, a pawn that has been reused for a player who respawned; either way
-/// nobody was shot. And both readings have to be plausible, so a health read
-/// out of a pointer that has gone stale cannot invent a hit out of rubbish.
+/// nobody was shot.
+///
+/// And both readings have to be of somebody real. Plausible health is not
+/// enough on its own: a slot that has been freed and zeroed reads as health
+/// nought, which is inside the plausible range and is also exactly what being
+/// killed looks like, so it would write a fatal hit for a player nobody shot.
+/// A zeroed slot's team reads as unassigned, and nobody unassigned is playing
+/// — which is the tell, and the only one there is.
 pub fn damage_between(before: &[Player], now: &[Player]) -> Vec<Damage> {
     now.iter()
-        .filter(|player| player.plausible())
+        .filter(|player| player.plausible() && player.team.plays())
         .filter_map(|player| {
-            let was = before
-                .iter()
-                .find(|earlier| earlier.pawn == player.pawn && earlier.plausible())?;
+            let was = before.iter().find(|earlier| {
+                earlier.pawn == player.pawn && earlier.plausible() && earlier.team.plays()
+            })?;
             (player.health < was.health).then_some(Damage {
                 pawn: player.pawn,
                 team: player.team,
@@ -423,6 +429,20 @@ mod tests {
         // full health is ordinary rather than a hit.
         assert_eq!(damage_between(&[], &[standing(1, 40)]), vec![]);
         assert_eq!(damage_between(&[standing(1, 40)], &[]), vec![]);
+    }
+
+    #[test]
+    fn a_freed_slot_reading_zero_is_not_somebody_who_was_just_killed() {
+        // The most common shape of rubbish, and the one that looks most like
+        // a real event: a pawn released and its memory zeroed reads health
+        // nought, which is inside the plausible range and is what a death
+        // looks like. Its team reads unassigned, and nobody unassigned plays.
+        let freed = Player {
+            team: Team::Unassigned,
+            ..standing(1, 0)
+        };
+        assert_eq!(damage_between(&[standing(1, 100)], &[freed]), vec![]);
+        assert_eq!(damage_between(&[freed], &[standing(1, 40)]), vec![]);
     }
 
     #[test]
