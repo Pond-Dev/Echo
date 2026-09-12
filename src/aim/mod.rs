@@ -738,6 +738,7 @@ pub enum Refusal {
     NoEnemyInTheCone,
     HandWins,
     Easing,
+    Watching,
     Delivered,
     PullSpent,
     PullGaveUp,
@@ -754,7 +755,10 @@ impl Refusal {
     /// a line, and every line is a write into a file from the middle of the
     /// frame. The tally still counts them apart; the log does not need to.
     pub const fn live(self) -> bool {
-        matches!(self, Self::Steering | Self::Easing | Self::HandWins)
+        matches!(
+            self,
+            Self::Steering | Self::Easing | Self::HandWins | Self::Watching
+        )
     }
 
     /// Every refusal there is, which is what makes a tally of them complete.
@@ -762,7 +766,7 @@ impl Refusal {
     /// Listed rather than derived, and held to the real list by a test: a
     /// reason missing from here would be a reason nothing ever reports, which
     /// is the exact shape of the failure the tally exists to catch.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::NotHeld,
         Self::NotInFront,
         Self::NoLocalPlayer,
@@ -773,6 +777,7 @@ impl Refusal {
         Self::NoEnemyInTheCone,
         Self::HandWins,
         Self::Easing,
+        Self::Watching,
         Self::Delivered,
         Self::PullSpent,
         Self::PullGaveUp,
@@ -803,11 +808,12 @@ impl Refusal {
             Self::NoEnemyInTheCone => 7,
             Self::HandWins => 8,
             Self::Easing => 9,
-            Self::Delivered => 10,
-            Self::PullSpent => 11,
-            Self::PullGaveUp => 12,
-            Self::WindowsRefused => 13,
-            Self::Steering => 14,
+            Self::Watching => 10,
+            Self::Delivered => 11,
+            Self::PullSpent => 12,
+            Self::PullGaveUp => 13,
+            Self::WindowsRefused => 14,
+            Self::Steering => 15,
         }
     }
 
@@ -824,6 +830,7 @@ impl Refusal {
             Self::NoPositionForUs => "no-position",
             Self::NoEnemyInTheCone => "no-enemy",
             Self::HandWins => "hand",
+            Self::Watching => "watching",
             Self::Delivered => "delivered",
             Self::PullSpent => "pull-spent",
             Self::PullGaveUp => "pull-gave-up",
@@ -844,6 +851,7 @@ impl Refusal {
             Self::NoPositionForUs => "our own position is not readable",
             Self::NoEnemyInTheCone => "no living enemy in the cone",
             Self::HandWins => "your hand",
+            Self::Watching => "watching — would have steered",
             Self::Delivered => "delivered — the rest is yours",
             Self::PullSpent => "this press has had its pull, on someone else",
             Self::PullGaveUp => "this pull is not getting there — giving it up",
@@ -1674,6 +1682,10 @@ mod tests {
         for live in [Refusal::Steering, Refusal::Easing, Refusal::HandWins] {
             assert!(live.live(), "{live:?}");
         }
+        assert!(
+            Refusal::Watching.live(),
+            "a pull it is only watching is one"
+        );
         for done in [
             Refusal::NotHeld,
             Refusal::Delivered,

@@ -103,20 +103,41 @@ const ENEMY: COLORREF = rgb(255, 70, 70);
 const TEXT: COLORREF = rgb(235, 235, 235);
 const WARN: COLORREF = rgb(255, 190, 60);
 
+/// Whether this run is allowed to move the mouse.
+///
+/// A run that decides everything and sends nothing is the control this had
+/// none of. Every figure so far has said what happens with the assist and
+/// none of them said what happens without it, so none of them said what the
+/// assist is worth. Watching leaves the readings, the choosing, the refusals
+/// and the hit lines exactly as they are, and the offsets recorded are then
+/// the player's own aim.
+fn watching_only() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|argument| matches!(argument.as_str(), "--watch" | "--off"))
+}
+
 fn main() {
     let mut log = Log::create();
     if let Some(path) = log.path() {
         println!("log: {}", path.display());
     }
 
-    if let Err(error) = run(&mut log) {
+    let watching = watching_only();
+    log.say(if watching {
+        "WATCHING ONLY — deciding everything, sending nothing. Pass no arguments to steer."
+    } else {
+        "STEERING — pass --watch to measure the same session without it."
+    });
+
+    if let Err(error) = run(&mut log, watching) {
         println!("\nFailed: {error}");
         log.record(&format!("failed: {error}"));
     }
     wait_before_closing();
 }
 
-fn run(log: &mut Log) -> Result<(), AttachError> {
+fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
     let Some(game) = Game::attach()? else {
         log.say("cs2.exe is running but client.dll has not loaded yet.");
         return Ok(());
@@ -143,7 +164,10 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     // Bound to the overlay's window, so it is created and dropped with it.
     let mut mouse: Option<RawMouse> = None;
 
-    let mut aim = Aim::default();
+    let mut aim = Aim {
+        watching,
+        ..Aim::default()
+    };
     let mut next_aim = Instant::now();
     // The previous pass's roster, kept whole rather than as the key the log
     // is deduplicated on, because who lost health is the one thing worth
@@ -581,6 +605,13 @@ struct Aim {
     /// be read as a length on a chest rather than as an angle, which cannot
     /// be read at all without it.
     distance: f32,
+    /// Whether this run may move the mouse at all.
+    ///
+    /// Held here rather than asked at the point of sending, so that the
+    /// deciding, the refusals and the tally are identical either way and a
+    /// watching run is a measurement of the same machine rather than of a
+    /// different one.
+    watching: bool,
     /// Whether the button is down, regardless of whether anything may come
     /// of it. What a press is counted from.
     held: bool,
@@ -754,6 +785,15 @@ impl Aim {
         }
         let reason = match choice.counts {
             Err(refusal) => refusal,
+            // Counted as though it had gone out, because what is being
+            // measured is what the assist would have done — and because the
+            // pull has to spend its budget either way or a watching run would
+            // decide differently from the run it is the control for.
+            Ok(counts) if self.watching => {
+                self.sent[0] += i64::from(counts[0]);
+                self.sent[1] += i64::from(counts[1]);
+                Refusal::Watching
+            }
             Ok(counts) => {
                 if input::move_by(counts[0], counts[1]) {
                     self.sent[0] += i64::from(counts[0]);
@@ -771,11 +811,17 @@ impl Aim {
 
     /// Every refusal and how often it has happened, zeros included.
     fn tally(&self) -> String {
-        Refusal::ALL
-            .iter()
-            .fold("aim tally".to_owned(), |line, refusal| {
-                line + &format!(" {}={}", refusal.key(), self.tally[refusal.slot()])
-            })
+        // The mode goes on the line rather than only at the top of the
+        // file, because a tally read on its own out of a log is exactly the
+        // thing that would be read as the wrong one.
+        let start = if self.watching {
+            "aim tally (watching only)"
+        } else {
+            "aim tally"
+        };
+        Refusal::ALL.iter().fold(start.to_owned(), |line, refusal| {
+            line + &format!(" {}={}", refusal.key(), self.tally[refusal.slot()])
+        })
     }
 
     fn describe(&self) -> String {
@@ -800,7 +846,8 @@ impl Aim {
             );
         }
         if self.sent != [0; 2] {
-            line += &format!("   sent {:+} {:+}", self.sent[0], self.sent[1]);
+            let what = if self.watching { "would send" } else { "sent" };
+            line += &format!("   {what} {:+} {:+}", self.sent[0], self.sent[1]);
         }
         if self.active || self.passes > 0 {
             line += &format!("   grip {:.0}%", self.grip.firmness() * 100.0);
