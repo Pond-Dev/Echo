@@ -282,14 +282,31 @@ fn soften(counts: f32, cap: f32, grip: f32) -> i32 {
 /// changing one of them silently moves it.
 pub const STEERING: Steering = Steering {
     counts_per_degree: 51.0,
-    gain: 0.35,
-    // Five degrees a pass, which at this rate is a fast flick and not a spin.
-    // What a reading caught mid-write is allowed to cost. Approached and
-    // never reached, so there is no distance at which the assist stops
-    // accelerating and starts coasting.
-    cap: 250.0,
+    // Set against the player rather than against the clock. A hundred and
+    // forty seconds played with the assist watching and sending nothing
+    // measured how fast a hand closes an angle: four and a half degrees a
+    // second at the median, ten at three quarters, twenty-two at nine
+    // tenths, and a hundred and fifty-five at its fastest.
+    //
+    // At a third the assist did eighty-seven degrees a second two degrees
+    // out and five hundred and forty-six twenty degrees out — ten to fifty
+    // times a hand, and past the fastest flick in the session before it was
+    // even five degrees from the target. That is what "somebody else's hand"
+    // is, written down.
+    gain: 0.18,
+    // A degree and a half a pass: a hundred and forty-seven degrees a second,
+    // just inside the fastest movement the player was seen to make. What a
+    // reading caught mid-write is allowed to cost, and the speed nothing may
+    // exceed. Approached and never reached, so there is no distance at which
+    // the assist stops accelerating and starts coasting.
+    cap: 60.0,
     deadzone: 0.15,
-    least_grip: 0.25,
+    // High enough that a live pass always moves something. The smallest
+    // movement worth making is the deadzone, and at this gain a quarter of
+    // strength rounded that to nothing — a band where the assist counted as
+    // live, was charged for being live, and sent nothing, which is the
+    // flicker the floor was put in to remove, one layer down.
+    least_grip: 0.4,
     settle_within: 6.0,
     pull_limit: Duration::from_millis(300),
     eye_height: 64.0,
@@ -1660,6 +1677,24 @@ mod tests {
     }
 
     #[test]
+    fn the_assist_never_moves_faster_than_the_hand_it_is_helping() {
+        // Measured, not chosen: a hundred and forty seconds of play with
+        // nothing being sent put the fastest angle the player closed at a
+        // hundred and fifty-five degrees a second. Above that the movement is
+        // not one they could have made, and no amount of smoothing hides it.
+        const FASTEST_HAND: f32 = 155.0;
+        const PASS: f32 = 0.008;
+
+        let fastest = STEERING.cap / STEERING.counts_per_degree / PASS;
+        assert!(fastest <= FASTEST_HAND, "{fastest:.0} degrees a second");
+
+        // And it has to be worth having: closing twenty degrees at the
+        // ceiling must fit inside what one press may spend.
+        let far = 20.0 / fastest;
+        assert!(far < STEERING.pull_limit.as_secs_f32(), "{far:.2} s");
+    }
+
+    #[test]
     fn half_strength_is_still_strength() {
         // The floor cuts a force too faint to be worth feeling, and nothing
         // else. Raised far enough it would be a switch again with extra
@@ -1706,7 +1741,10 @@ mod tests {
             yaw: -STEERING.deadzone,
             pitch: 0.0,
         };
-        assert!(STEERING.counts(barely, STEERING.least_grip).is_some());
+        assert!(
+            STEERING.counts(barely, STEERING.least_grip).is_some(),
+            "the smallest movement worth making, at the least strength that              counts as making one, has to come to at least one count"
+        );
     }
 
     #[test]
