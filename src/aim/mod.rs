@@ -198,6 +198,25 @@ impl Ramp {
         }
         (moved as f32 / seconds / self.full_push).clamp(0.0, 1.0)
     }
+
+    /// The push that exactly holds the grip where it is.
+    ///
+    /// Below it the grip climbs even though the hand is moving, because a
+    /// hand nudging alongside the assist is not taking the view from it.
+    /// Above it the grip falls, and the harder the push the sooner it reaches
+    /// nothing.
+    ///
+    /// Not a constant of its own. It falls out of the two durations, so it
+    /// cannot come to disagree with them — which is the only way a third
+    /// number describing the same crossing could end up.
+    pub fn holding_push(self) -> f32 {
+        let rise = self.rise.as_secs_f32();
+        let fall = self.fall.as_secs_f32();
+        if rise + fall <= 0.0 {
+            return 0.0;
+        }
+        fall / (rise + fall)
+    }
 }
 
 /// How firmly the assist is holding the view, from nothing to full.
@@ -244,12 +263,21 @@ impl Grip {
     /// without waiting for a clock, and so it takes the same time at any rate
     /// the loop happens to run at.
     pub fn update(&mut self, engaged: bool, push: f32, elapsed: Duration, ramp: Ramp) -> f32 {
-        let push = if engaged { push.clamp(0.0, 1.0) } else { 1.0 };
-        self.along += if push > 0.0 {
-            -Self::step(elapsed, ramp.fall) * push
+        // A push nobody could measure is treated as a push at full rate. Every
+        // uncertainty here falls the same way: towards the player having the
+        // view, never towards the assist keeping it.
+        let push = if engaged && push.is_finite() {
+            push.clamp(0.0, 1.0)
         } else {
-            Self::step(elapsed, ramp.rise)
+            1.0
         };
+        // Both at once, in proportion, rather than one or the other. Choosing
+        // between them on whether the hand moved at all made a single count
+        // enough to forbid the rise entirely, and a hand on a mouse produces
+        // a count in most passes — so through a session of ordinary play the
+        // grip could only ever fall. It sat between nothing and one per cent.
+        self.along +=
+            Self::step(elapsed, ramp.rise) * (1.0 - push) - Self::step(elapsed, ramp.fall) * push;
         self.along = self.along.clamp(0.0, 1.0);
         smooth(self.along)
     }
@@ -671,12 +699,39 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_pushing_gently_still_ends_with_the_view_rather_than_never_winning() {
+    fn a_hand_moving_alongside_the_assist_does_not_stop_it_from_taking_hold() {
+        // The failure this replaces: the rise was refused whenever the hand
+        // had moved at all, and a hand resting on a mouse produces a count in
+        // most passes, so through ordinary play the grip could only ever
+        // fall. A session held it between nothing and one per cent.
         let mut grip = Grip::default();
-        assert!(ramped(&mut grip, true, 0.0, ramp().rise) > 0.99);
-        // A tenth of a full push, for ten falls. A threshold would have left
-        // this hand pinned under the assist for as long as it cared to push.
-        assert_eq!(ramped(&mut grip, true, 0.1, ramp().fall * 11), 0.0);
+        let nudging = ramp().holding_push() / 3.0;
+        let firmness = ramped(&mut grip, true, nudging, ramp().rise * 3);
+        assert!(
+            firmness > 0.9,
+            "a nudge should not forbid the rise: {firmness}"
+        );
+    }
+
+    #[test]
+    fn a_push_past_the_holding_point_ends_with_the_player_having_the_view() {
+        // And the harder the push the sooner, rather than every push above
+        // some line arriving at the same moment.
+        let mut hard = Grip::default();
+        let mut firm = Grip::default();
+        ramped(&mut hard, true, 0.0, ramp().rise);
+        ramped(&mut firm, true, 0.0, ramp().rise);
+
+        let over = ramp().fall * 2;
+        assert_eq!(ramped(&mut hard, true, 1.0, over), 0.0);
+        assert_eq!(ramped(&mut firm, true, 0.75, over * 3), 0.0);
+
+        // Exactly at the holding point it goes nowhere, which is what makes
+        // the point worth naming.
+        let mut held = Grip::default();
+        let half = ramped(&mut held, true, 0.0, ramp().rise / 2);
+        let after = ramped(&mut held, true, ramp().holding_push(), ramp().rise * 2);
+        assert!((after - half).abs() < 0.05, "{half} then {after}");
     }
 
     #[test]
