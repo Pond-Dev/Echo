@@ -645,7 +645,7 @@ impl Aim {
             line += &format!(
                 "   target 0x{pawn:X}   off {:.2} deg = {across:.0}u of {:.0}u at {:.0}u  (yaw {:+.2} pitch {:+.2})",
                 self.offset.size(),
-                STEERING.body_half_width,
+                STEERING.settle_within,
                 self.distance,
                 self.offset.yaw,
                 self.offset.pitch

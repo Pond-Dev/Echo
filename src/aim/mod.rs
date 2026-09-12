@@ -22,13 +22,13 @@
 //! what the player practised, and inaccuracy while moving keeps duels down to
 //! a few hundred milliseconds. There is no long window to track through.
 //!
-//! Handing over anywhere on the body rather than on the head is the
-//! difference the whole product is named for. A pull that ends on the head
-//! has done the aiming; a pull that ends on the chest has closed the angle
-//! and left the aiming — the shot connects, and whether it kills is still the
-//! player's. It also needs no rule about distance: a body subtends less angle
-//! the further away it is, so the further the shot — the harder it is, and
-//! the more obvious an assist would be — the less this touches.
+//! Stopping on the chest rather than on the head is the difference the whole
+//! product is named for. A pull that ends on the head has done the aiming; a
+//! pull that ends on the chest has closed the angle and left the aiming — the
+//! shot connects, and whether it kills is still the player's. It also needs
+//! no rule about distance: a length subtends less angle the further away it
+//! is, so the further the shot — the harder it is, and the more obvious an
+//! assist would be — the less this touches.
 //!
 //! The point aimed at and the width handed over at have to describe the same
 //! shape, and once did not. The pull aimed at the head and handed over at the
@@ -156,20 +156,28 @@ pub struct Steering {
     /// the head is doing the aiming, and the product is named for the
     /// difference.
     pub aim_height: f32,
-    /// Half the width of the part of a player a bullet registers on.
+    /// How far from the aim point the pull may stop, in world units.
     ///
-    /// What the pull is finished at, as an angle worked out against the
-    /// target's distance rather than fixed: a body is over a degree wide at
-    /// five hundred units and a third of one at two thousand, and a single
-    /// angle would mean handing over short of the target up close and well
-    /// past it at range.
+    /// Worked out against the target's distance rather than fixed, since the
+    /// same length is over a degree at five hundred units and a third of one
+    /// at two thousand, and a single angle would mean stopping short of the
+    /// target up close and well past it at range.
     ///
-    /// ponytail: an estimate. A standing player's bounding box is thirty-two
-    /// units across, but the person inside it is narrower than the box, so
-    /// handing over at the box's half-width parks the view on an edge where a
-    /// shot grazes or misses. Twelve is a guess at the shoulders. Replace it
-    /// with the real hitbox geometry, which the old product already has.
-    pub body_half_width: f32,
+    /// **This is where the pull comes to rest, not a limit it stays inside.**
+    /// Each pass covers a share of what is left and the pull stops the first
+    /// pass it is within this, so it always arrives just inside the edge and
+    /// never near the middle. Sixty-eight deliveries in one session had a
+    /// median miss of ten units against a boundary of twelve. Set as a width
+    /// to be inside — a body's, a chest's — it parks the view on the outline
+    /// of whatever it was set from, which is where shots graze.
+    ///
+    /// So it is set well inside the torso instead: what is wanted is not the
+    /// largest miss that still counts but the miss the pull should leave, and
+    /// the player closes what remains if they want a head.
+    ///
+    /// ponytail: a guess at a fraction of a torso. Replace it with the real
+    /// hitbox geometry, which the old product already has.
+    pub settle_within: f32,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
     ///
@@ -237,7 +245,7 @@ pub const STEERING: Steering = Steering {
     // accelerating and starts coasting.
     cap: 250.0,
     deadzone: 0.15,
-    body_half_width: 12.0,
+    settle_within: 6.0,
     eye_height: 64.0,
     aim_height: 55.0,
     cone: 30.0,
@@ -493,17 +501,15 @@ impl Steering {
         choice
     }
 
-    /// The angle a target of this distance is handed over at.
+    /// The angle at which a target this far away is close enough.
     ///
     /// Never under the deadzone, which is the width below which a movement is
-    /// a tremble rather than aim. At the distances a CS2 map allows, the body
-    /// is wider than that everywhere, so the floor is a guard and not a rule
-    /// anyone will meet.
+    /// a tremble rather than aim.
     pub fn handover(self, distance: f32) -> f32 {
         if !distance.is_finite() || distance <= 0.0 {
             return self.deadzone;
         }
-        (self.body_half_width / distance)
+        (self.settle_within / distance)
             .atan()
             .to_degrees()
             .max(self.deadzone)
@@ -751,7 +757,7 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
-            body_half_width: 12.0,
+            settle_within: 6.0,
             eye_height: 64.0,
             aim_height: 55.0,
             cone: 30.0,
@@ -1323,17 +1329,18 @@ mod tests {
 
     #[test]
     fn the_pull_ends_the_moment_the_view_is_anywhere_inside_the_target() {
-        // Level with us, so adding the same eye height to both leaves the
-        // view exactly on them.
-        let dead_ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
+        // Standing nine units up, so their chest is level with our eye and
+        // the view is exactly on them. Level ground would not do it: the pull
+        // aims lower than it measures from, so a target on the same floor a
+        // thousand units away is half a degree below the crosshair.
+        let dead_ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 9.0])]);
         let choice = STEERING.choose(&situation(&dead_ahead), 1.0, 0.0);
         assert!(choice.arrived);
         assert_eq!(choice.counts, Err(Refusal::Delivered));
 
-        // A third of a degree off at a thousand units is still inside a
-        // body, which is what the handover is measured against — not the
-        // fraction of a degree that stops a tremble.
-        let nearly = facing_east(&[enemy(0x2000, [1000.0, 5.0, 0.0])]);
+        // A fifth of a degree off at a thousand units is three units across,
+        // which is where the pull is meant to come to rest.
+        let nearly = facing_east(&[enemy(0x2000, [1000.0, 3.0, 9.0])]);
         let choice = STEERING.choose(&situation(&nearly), 1.0, 0.0);
         assert!(choice.arrived, "off by {:.2} deg", choice.offset.size());
     }
@@ -1344,8 +1351,8 @@ mod tests {
         // past one at range. These are the widths a player subtends.
         let close = STEERING.handover(500.0);
         let far = STEERING.handover(2000.0);
-        assert!((close - 1.38).abs() < 0.05, "{close}");
-        assert!((far - 0.34).abs() < 0.05, "{far}");
+        assert!((close - 0.69).abs() < 0.05, "{close}");
+        assert!((far - 0.17).abs() < 0.05, "{far}");
         assert!(close > far);
 
         // And never under the width that stops a tremble, however far away.
@@ -1430,7 +1437,7 @@ mod tests {
         // A player stands seventy-two units tall and the pull aims at the
         // chest, so the circle must not reach the top of the head or the
         // ground, nor further out than the shoulders.
-        let reach = STEERING.body_half_width;
+        let reach = STEERING.settle_within;
         assert!(
             STEERING.aim_height + reach < 72.0,
             "the circle reaches over the head"
@@ -1439,6 +1446,17 @@ mod tests {
         assert!(
             STEERING.aim_height < 64.0,
             "aiming at or above the eyes is aiming at the head"
+        );
+
+        // And with room to spare, because the pull comes to rest at this
+        // distance rather than staying inside it. Set to a torso's half-width
+        // it parks on the outline of the torso; a session's sixty-eight
+        // deliveries had a median miss of ten units against a boundary of
+        // twelve, which is an arm.
+        const TORSO_HALF_WIDTH: f32 = 12.0;
+        assert!(
+            reach <= TORSO_HALF_WIDTH / 2.0,
+            "the pull rests {reach} units off centre, on a torso half {TORSO_HALF_WIDTH} wide"
         );
     }
 
