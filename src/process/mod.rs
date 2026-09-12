@@ -136,6 +136,21 @@ impl Process {
         self.read(address, &mut bytes)?;
         Ok(f32::from_le_bytes(bytes))
     }
+
+    pub fn read_i32(&self, address: usize) -> windows::core::Result<i32> {
+        let mut bytes = [0u8; 4];
+        self.read(address, &mut bytes)?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    /// Read a pointer. `None` for null, which callers almost always want to
+    /// treat as an ordinary absence rather than dereference.
+    pub fn read_pointer(&self, address: usize) -> windows::core::Result<Option<usize>> {
+        let mut bytes = [0u8; 8];
+        self.read(address, &mut bytes)?;
+        let value = u64::from_le_bytes(bytes) as usize;
+        Ok((value != 0).then_some(value))
+    }
 }
 
 impl Drop for Process {
