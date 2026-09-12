@@ -1,25 +1,33 @@
-//! Echo — step 7: read the player's own mouse.
+//! Echo — the step that sends the mouse somewhere.
 //!
-//! Six steps of reading the game end here; this reads the hand. Not where the
-//! cursor is — Windows moves that through acceleration and stops it at the
-//! screen edge, and a game reads neither — but the counts the device itself
-//! reports.
+//! Every step before this one read or drew, and being wrong cost a box in the
+//! wrong place. This one moves the view, so being wrong drags someone's aim
+//! off target mid-round. It is therefore the smallest movement that can still
+//! be seen: hold one key and the view turns steadily to the right, at a
+//! constant rate, until the key is let go. Nothing aims at anything.
 //!
-//! Nothing acts on them yet. What they are for is the principle the whole
-//! product is built on: a tool that yields to the player has to know what the
-//! player did, separately from what it did itself. That comparison is step
-//! nine, and it is impossible without this.
+//! Two guards, both about not touching what we were not invited to touch:
+//! nothing is sent unless the game is the window in front, and nothing is
+//! sent unless the key is down this instant.
 //!
-//! The check is your hand: move the mouse and the counts move with it, in the
-//! same direction, while the game still has focus.
+//! The check is the turn readout. Windows moving a pointer would prove only
+//! that Windows moved a pointer — the view angle changing is what says the
+//! counts arrived inside CS2. Hold the key and the figure climbs; let go and
+//! it stops.
+//!
+//! Watch the hand readout while holding it, too. It counts our own movement
+//! as well as yours, because Windows hands injected input to raw input like
+//! any other. Telling those apart is a later step, and nothing here tries to.
 
 use std::time::{Duration, Instant};
 
-use echo::game::{Game, LocalPlayer, Player, Team, ViewMatrix};
-use echo::input::RawMouse;
+use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
+use echo::input::{self, RawMouse};
 use echo::log::Log;
 use echo::overlay::{FrameCost, Overlay, rgb};
 use echo::process::AttachError;
+use windows::Win32::Foundation::COLORREF;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_INSERT};
 use windows::core::w;
 
 /// Target frame time. The game draws far faster than this, so a box is always
@@ -30,9 +38,16 @@ const ATTACH_RETRY: Duration = Duration::from_millis(500);
 /// How often the achieved rate is written to the log.
 const PACE_REPORT: Duration = Duration::from_secs(2);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-const ENEMY: windows::Win32::Foundation::COLORREF = rgb(255, 70, 70);
-const TEXT: windows::Win32::Foundation::COLORREF = rgb(235, 235, 235);
-const WARN: windows::Win32::Foundation::COLORREF = rgb(255, 190, 60);
+/// Held to send movement. Chosen for being bound to nothing in CS2, so the
+/// only thing that happens while it is down is the thing under test.
+const NUDGE_KEY: VIRTUAL_KEY = VK_INSERT;
+/// Counts sent per frame while that key is held. Small enough that the turn
+/// is a drift rather than a jump — a jump would prove the same thing and be a
+/// much worse thing to be surprised by.
+const NUDGE: i32 = 4;
+const ENEMY: COLORREF = rgb(255, 70, 70);
+const TEXT: COLORREF = rgb(235, 235, 235);
+const WARN: COLORREF = rgb(255, 190, 60);
 
 fn main() {
     let mut log = Log::create();
@@ -74,6 +89,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     // Bound to the overlay's window, so it is created and dropped with it.
     let mut mouse: Option<RawMouse> = None;
 
+    let mut nudge = Nudge::default();
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -129,11 +145,30 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
             })
         });
 
+        // Read for this step alone, and read here rather than with the others
+        // because it is measured against a movement sent a moment later.
+        let angles = Stages::time(&mut stages.angles, || game.view_angles())?;
+        // Focus is a guard, not a preference. With the game behind something
+        // else, the same counts drag the pointer across whatever is in front.
+        let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
+        Stages::time(&mut stages.nudge, || nudge.send(allowed, angles.yaw));
+
         if let Some(overlay) = overlay.as_mut() {
             Stages::time(&mut stages.pump, || overlay.pump());
             Stages::time(&mut stages.follow, || overlay.follow_target());
             stages.drawing = Stages::time(&mut stages.overlay, || {
-                draw_overlay(overlay, view, me, &players, pace, hand, mouse.as_ref())
+                draw_overlay(
+                    overlay,
+                    view,
+                    me,
+                    &players,
+                    &Readouts {
+                        pace,
+                        hand,
+                        mouse: mouse.as_ref(),
+                        nudge,
+                    },
+                )
             });
         }
         stages.reads = game.take_reads();
@@ -191,6 +226,11 @@ struct Stages {
     log: Duration,
     /// Reading the player's own mouse.
     hand: Duration,
+    /// Reading the view angle, which is this step's evidence.
+    angles: Duration,
+    /// Sending movement. Named separately from everything else because it is
+    /// the one stage whose effect leaves this process.
+    nudge: Duration,
     /// Reading the overlay's own message queue.
     pump: Duration,
     /// Keeping the overlay over the game and on top of it. Asks the window
@@ -217,7 +257,15 @@ impl Stages {
     }
 
     fn total(self) -> Duration {
-        self.me + self.players + self.matrix + self.overlay + self.pump + self.follow + self.log
+        self.me
+            + self.players
+            + self.matrix
+            + self.angles
+            + self.nudge
+            + self.overlay
+            + self.pump
+            + self.follow
+            + self.log
     }
 
     /// One line per stage, worst first, with its share of the frame. Sorted so
@@ -232,6 +280,8 @@ impl Stages {
             ("read me", self.me),
             ("write log", self.log),
             ("read hand", self.hand),
+            ("read angles", self.angles),
+            ("send nudge", self.nudge),
             ("pump messages", self.pump),
             ("follow window", self.follow),
         ];
@@ -339,6 +389,95 @@ impl Pace {
     }
 }
 
+/// Pushing the view sideways while a key is held, and the evidence that it
+/// worked.
+///
+/// The counts sent and the angle turned are kept side by side on purpose. One
+/// is what we asked for and the other is what the game did, and this step is
+/// finished when the second answers the first. How much turn a count buys is
+/// a question for the step that has somewhere to aim.
+#[derive(Clone, Copy)]
+struct Nudge {
+    sending: bool,
+    /// Why not, when not. A key held while the game sits behind a browser has
+    /// to read as refused rather than as idle, or the readout makes it look
+    /// as though sending is broken.
+    blocked: bool,
+    /// Counts sent since the key went down.
+    sent: i64,
+    /// Sends Windows would not accept. Elevation exists to keep this at zero.
+    refused: u64,
+    /// Where the view was pointing when the key went down, and the turn since.
+    from: ViewAngles,
+    turned: f32,
+}
+
+impl Default for Nudge {
+    fn default() -> Self {
+        Self {
+            sending: false,
+            blocked: false,
+            sent: 0,
+            refused: 0,
+            from: ViewAngles {
+                pitch: 0.0,
+                yaw: 0.0,
+            },
+            turned: 0.0,
+        }
+    }
+}
+
+impl Nudge {
+    fn send(&mut self, allowed: bool, yaw: f32) {
+        let down = input::held(NUDGE_KEY);
+        self.blocked = down && !allowed;
+        let sending = down && allowed;
+
+        // Each hold is measured on its own. Carrying the totals across holds
+        // would leave the turn figure describing several presses at once, so
+        // a run of small holds would read as one large one.
+        if sending && !self.sending {
+            self.from = ViewAngles { pitch: 0.0, yaw };
+            self.sent = 0;
+            self.turned = 0.0;
+        }
+        self.sending = sending;
+        if !sending {
+            return;
+        }
+
+        if input::move_by(NUDGE, 0) {
+            self.sent += i64::from(NUDGE);
+        } else {
+            self.refused += 1;
+        }
+        // Measured against the yaw read *before* this send, so the figure is
+        // one frame behind what was asked for. Which is honest: the game has
+        // not run a frame yet, and crediting a turn to a movement it has not
+        // seen would be the readout agreeing with itself.
+        self.turned = ViewAngles { pitch: 0.0, yaw }.turn_from(self.from);
+    }
+
+    fn describe(&self) -> String {
+        let state = match (self.sending, self.blocked) {
+            (true, _) => "sending",
+            (_, true) => "held, but the game is not in front",
+            _ => "idle",
+        };
+        format!(
+            "nudge {state}   sent {} counts   turned {:+.1} deg{}",
+            self.sent,
+            self.turned,
+            if self.refused > 0 {
+                format!("   {} refused — not elevated?", self.refused)
+            } else {
+                String::new()
+            }
+        )
+    }
+}
+
 /// How tall a standing player is, in world units.
 ///
 /// ponytail: one constant. Crouching makes a player shorter and this will draw
@@ -360,9 +499,7 @@ fn draw_overlay(
     view: ViewMatrix,
     me: Option<LocalPlayer>,
     players: &[Player],
-    pace: Pace,
-    hand: [i64; 2],
-    mouse: Option<&RawMouse>,
+    readouts: &Readouts<'_>,
 ) -> FrameCost {
     let bounds = overlay.bounds();
     overlay.frame(|canvas| {
@@ -410,12 +547,42 @@ fn draw_overlay(
             format!("echo  {}x{}", bounds.width, bounds.height),
             format!("{} health {}", me.team.label(), me.health),
             format!("{drawn} enemies on screen of {}", players.len()),
-            pace.describe(),
-            match mouse {
+        ];
+        status.extend(readouts.lines());
+
+        // Readings that failed their check are called out rather than being
+        // silently skipped: a count that climbs is what a game update looks
+        // like from here. Kept in their own list so the warning colour follows
+        // the warnings, rather than every line past a counted-out row.
+        let mut rows: Vec<(String, COLORREF)> =
+            status.into_iter().map(|line| (line, TEXT)).collect();
+        if rejected > 0 {
+            rows.push((format!("{rejected} implausible — stale offsets?"), WARN));
+        }
+        for (row, (line, colour)) in rows.iter().enumerate() {
+            canvas.text(12, 12 + row as i32 * 18, line, *colour);
+        }
+    })
+}
+
+/// What the corner of the screen says about the run itself, rather than about
+/// anything in the world.
+struct Readouts<'a> {
+    pace: Pace,
+    hand: [i64; 2],
+    mouse: Option<&'a RawMouse>,
+    nudge: Nudge,
+}
+
+impl Readouts<'_> {
+    fn lines(&self) -> Vec<String> {
+        vec![
+            self.pace.describe(),
+            match self.mouse {
                 Some(mouse) => format!(
                     "hand {:>6} {:>6}   {} packets{}",
-                    hand[0],
-                    hand[1],
+                    self.hand[0],
+                    self.hand[1],
                     mouse.packets(),
                     if mouse.absolute() > 0 {
                         format!("   {} absolute — unreadable device", mouse.absolute())
@@ -425,18 +592,9 @@ fn draw_overlay(
                 ),
                 None => "no raw mouse".to_owned(),
             },
-        ];
-        // Readings that failed their check are called out rather than being
-        // silently skipped: a count that climbs is what a game update looks
-        // like from here.
-        if rejected > 0 {
-            status.push(format!("{rejected} implausible — stale offsets?"));
-        }
-        for (row, line) in status.iter().enumerate() {
-            let colour = if row >= 5 { WARN } else { TEXT };
-            canvas.text(12, 12 + row as i32 * 18, line, colour);
-        }
-    })
+            self.nudge.describe(),
+        ]
+    }
 }
 
 /// Sort key: enemies, then teammates, then the rest.

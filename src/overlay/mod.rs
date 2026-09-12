@@ -30,10 +30,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
-    HWND_TOPMOST, IsWindow, LWA_COLORKEY, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-    TranslateMessage, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    GetForegroundWindow, HWND_TOPMOST, IsWindow, LWA_COLORKEY, MSG, PM_REMOVE, PeekMessageW,
+    RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetLayeredWindowAttributes,
+    SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -295,6 +295,16 @@ impl Overlay {
     /// Whether the game window is still there.
     pub fn target_is_alive(&self) -> bool {
         unsafe { IsWindow(Some(self.target)).as_bool() }
+    }
+
+    /// Whether the game is the window the player is actually in.
+    ///
+    /// Asked because sent movement goes wherever the focus is. With the game
+    /// behind a browser, the same counts that would have turned the view drag
+    /// the pointer across whatever is in front instead — so this is what
+    /// stands between a tool that aims and a tool that grabs the desktop.
+    pub fn target_has_focus(&self) -> bool {
+        unsafe { GetForegroundWindow() == self.target }
     }
 
     /// Keep the overlay over the game, and on top of it.

@@ -293,6 +293,18 @@ impl ViewAngles {
             && (-90.0..=90.0).contains(&self.pitch)
             && (-180.0..=180.0).contains(&self.yaw)
     }
+
+    /// How far the yaw swung from an earlier reading to this one, the short
+    /// way round. Positive is the direction a rightward movement turns.
+    ///
+    /// Subtracting the two directly is wrong at one place on the compass: yaw
+    /// is normalised into half a turn either way, so a one-degree swing that
+    /// happens to cross that seam subtracts into nearly a whole circle. The
+    /// reading would be right everywhere a player happens to test it and
+    /// wrong in one direction on the map.
+    pub fn turn_from(self, earlier: Self) -> f32 {
+        (self.yaw - earlier.yaw + 540.0).rem_euclid(360.0) - 180.0
+    }
 }
 
 /// The local player's pawn, as far as Echo reads it today.
@@ -323,6 +335,34 @@ impl LocalPlayer {
 #[cfg(test)]
 mod tests {
     use super::{LocalPlayer, Team, ViewAngles};
+
+    fn facing(yaw: f32) -> ViewAngles {
+        ViewAngles { pitch: 0.0, yaw }
+    }
+
+    #[test]
+    fn a_turn_is_the_difference_in_yaw_and_keeps_its_direction() {
+        assert!((facing(30.0).turn_from(facing(10.0)) - 20.0).abs() < 1e-3);
+        assert!((facing(10.0).turn_from(facing(30.0)) + 20.0).abs() < 1e-3);
+        assert!(facing(45.0).turn_from(facing(45.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_small_turn_across_the_seam_stays_small_instead_of_becoming_a_full_circle() {
+        // Facing one way along the seam and swinging a degree past it. Plain
+        // subtraction gives 359, which would report a spin for a nudge.
+        let across = facing(-179.5).turn_from(facing(179.5));
+        assert!((across - 1.0).abs() < 1e-3, "got {across}");
+
+        let back = facing(179.5).turn_from(facing(-179.5));
+        assert!((back + 1.0).abs() < 1e-3, "got {back}");
+    }
+
+    #[test]
+    fn half_a_turn_is_reported_as_half_a_turn_rather_than_as_nothing() {
+        let half = facing(90.0).turn_from(facing(-90.0));
+        assert!(half.abs() > 179.0, "got {half}");
+    }
 
     fn player(health: i32) -> LocalPlayer {
         LocalPlayer {
