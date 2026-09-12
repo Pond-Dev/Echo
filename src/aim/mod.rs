@@ -806,6 +806,27 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// Whether this pass is one a pull spends itself on.
+    ///
+    /// Every way of being engaged with a target and not finished with it —
+    /// including the ways nothing went out, since a pass the grip was too low
+    /// for and a pass Windows refused were both passes the pull was running
+    /// through.
+    ///
+    /// Not the passes it declined to start on. Charging those made the budget
+    /// non-zero a few passes into any press, and the rule that only lets a
+    /// pull continue past the engage distance once it is under way reads
+    /// "under way" from the budget — so the assist quietly began pulling from
+    /// any distance a moment into every press. A log caught it in the act:
+    /// declining at twelve units, and steering at thirteen thirty-four
+    /// milliseconds later.
+    pub const fn spends_a_pull(self) -> bool {
+        matches!(
+            self,
+            Self::Steering | Self::Watching | Self::Easing | Self::HandWins | Self::WindowsRefused
+        )
+    }
+
     /// Whether this is the assist being live, for the purpose of deciding
     /// that something happened worth writing down.
     ///
@@ -1813,6 +1834,25 @@ mod tests {
             Refusal::Watching.live(),
             "a pull it is only watching is one"
         );
+        // What a pull is charged for is not the same list: declining to start
+        // is not a pass spent, and Windows refusing a movement is.
+        for free in [
+            Refusal::AlreadyClose,
+            Refusal::Delivered,
+            Refusal::PullSpent,
+            Refusal::PullGaveUp,
+            Refusal::NotHeld,
+        ] {
+            assert!(!free.spends_a_pull(), "{free:?}");
+        }
+        for spent in [
+            Refusal::Steering,
+            Refusal::Easing,
+            Refusal::HandWins,
+            Refusal::WindowsRefused,
+        ] {
+            assert!(spent.spends_a_pull(), "{spent:?}");
+        }
         for done in [
             Refusal::NotHeld,
             Refusal::Delivered,

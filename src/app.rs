@@ -766,7 +766,6 @@ impl Aim {
             self.offset = choice.offset;
             self.distance = choice.distance;
         }
-        self.charge(active, grip, elapsed);
         self.just_delivered = choice.arrived && self.delivered_to.is_none();
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
@@ -796,6 +795,7 @@ impl Aim {
                 }
             }
         };
+        self.charge(active, reason, grip, elapsed);
         self.reason = reason;
         self.tally[reason.slot()] += 1;
     }
@@ -808,14 +808,18 @@ impl Aim {
     ///
     /// Not on whether a movement went out: a pass Windows refused moved
     /// nothing, and a pass where the pull was live and the rounding happened
-    /// to land on zero was still a pass the assist spent.
+    /// to land on zero was still a pass the assist spent. But not on the
+    /// passes it declined to start either — the rule that lets a pull carry
+    /// on past the engage distance reads "under way" from this, so charging a
+    /// refusal to start let every press begin pulling from any distance a
+    /// moment in.
     ///
     /// Capped at a pass's worth, because the period read here is the last
     /// completed one and a stall — a rebuilt overlay, a descheduled thread —
     /// would otherwise charge half a second to whichever pass came next and
     /// end a pull that was converging.
-    fn charge(&mut self, active: bool, grip: f32, elapsed: Duration) {
-        if active && grip >= STEERING.least_grip {
+    fn charge(&mut self, active: bool, reason: Refusal, grip: f32, elapsed: Duration) {
+        if active && reason.spends_a_pull() && grip >= STEERING.least_grip {
             self.pulled_for += elapsed.min(MOST_OF_A_PASS);
         }
     }
@@ -1083,17 +1087,25 @@ mod tests {
     #[test]
     fn a_pull_is_charged_for_the_passes_it_was_live_on_and_no_others() {
         let mut aim = Aim::default();
+        let steering = Refusal::Steering;
 
-        aim.charge(false, 1.0, PASS);
+        aim.charge(false, steering, 1.0, PASS);
         assert_eq!(aim.pulled_for, Duration::ZERO, "the button was not down");
 
         // Below the floor the assist is not there, and a press it is never
         // live during is a press it never touches — so it cannot run away
         // with one either.
-        aim.charge(true, STEERING.least_grip - 0.01, PASS);
+        aim.charge(true, steering, STEERING.least_grip - 0.01, PASS);
         assert_eq!(aim.pulled_for, Duration::ZERO, "under the floor");
 
-        aim.charge(true, STEERING.least_grip, PASS);
+        // And a pass it declined to start on is not a pass it spent. This one
+        // cost the engage distance its whole meaning: charged, the budget
+        // went non-zero a moment into every press, and the rule that lets a
+        // pull carry on once under way reads "under way" from the budget.
+        aim.charge(true, Refusal::AlreadyClose, 1.0, PASS);
+        assert_eq!(aim.pulled_for, Duration::ZERO, "it declined to start");
+
+        aim.charge(true, steering, STEERING.least_grip, PASS);
         assert_eq!(aim.pulled_for, PASS);
     }
 
@@ -1103,7 +1115,7 @@ mod tests {
         // second of a rebuilt overlay would arrive as one pass's cost and end
         // a pull that was converging perfectly well.
         let mut aim = Aim::default();
-        aim.charge(true, 1.0, Duration::from_millis(500));
+        aim.charge(true, Refusal::Steering, 1.0, Duration::from_millis(500));
         assert_eq!(aim.pulled_for, MOST_OF_A_PASS);
         assert!(MOST_OF_A_PASS * 4 < STEERING.pull_limit);
     }
