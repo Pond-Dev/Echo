@@ -4,11 +4,15 @@
 //! one. They are deliberately separate steps of the build and stay separate
 //! here, because the whole product turns on telling the two apart.
 //!
-//! One thing they are not separate in: anything sent through [`send`] comes
-//! straight back through [`raw`], since Windows delivers injected movement to
-//! raw input the same as a device's. Reading the hand therefore does not yet
-//! mean reading *only* the hand — which is the problem the step about yielding
-//! to the player exists to solve, and is not solved here.
+//! Whether they stay separate all the way through Windows was an open
+//! question, and it has been measured rather than assumed: sending nine
+//! hundred movements over eight seconds, with the player's hand off the
+//! mouse, delivered no packets at all to [`raw`]. Injected movement does not
+//! return through our own sink, so what arrives there is the hand alone.
+//!
+//! Measured under one set of conditions, though — this window in the
+//! background, this machine — so the step that has to tell the two apart
+//! should confirm it rather than inherit it.
 
 pub mod raw;
 pub mod send;

@@ -15,9 +15,10 @@
 //! counts arrived inside CS2. Hold the key and the figure climbs; let go and
 //! it stops.
 //!
-//! Watch the hand readout while holding it, too. It counts our own movement
-//! as well as yours, because Windows hands injected input to raw input like
-//! any other. Telling those apart is a later step, and nothing here tries to.
+//! The hand readout is worth watching while holding it, too — it stays put.
+//! What we inject does not come back through our own raw input, so the counts
+//! there are yours and nothing else. That was measured here, not assumed, and
+//! the step that has to tell the two apart should measure it again.
 
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,13 @@ const FRAME: Duration = Duration::from_millis(8);
 const ATTACH_RETRY: Duration = Duration::from_millis(500);
 /// How often the achieved rate is written to the log.
 const PACE_REPORT: Duration = Duration::from_secs(2);
+/// How often a hold in progress is written to the log.
+///
+/// The totals at the end of an eight-second hold cannot say whether the view
+/// turned steadily or turned for one second and then stopped. Lines along the
+/// way can, by subtraction — which is the same mistake as measuring a turn
+/// from its two ends, made about time instead of about angle.
+const NUDGE_REPORT: Duration = Duration::from_millis(500);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
 /// Held to send movement. Chosen for being bound to nothing in CS2, so the
 /// only thing that happens while it is down is the thing under test.
@@ -90,6 +98,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     let mut mouse: Option<RawMouse> = None;
 
     let mut nudge = Nudge::default();
+    let mut next_nudge = Instant::now();
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -158,8 +167,9 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // the view was pointing and the end says what the counts bought —
         // which is this step's whole evidence, and a readout on a screen that
         // has since been closed cannot be asked about it afterwards.
-        if (nudge.sending, nudge.blocked) != before {
+        if (nudge.sending, nudge.blocked) != before || (nudge.sending && started >= next_nudge) {
             log.record(&nudge.describe());
+            next_nudge = started + NUDGE_REPORT;
         }
 
         if let Some(overlay) = overlay.as_mut() {
