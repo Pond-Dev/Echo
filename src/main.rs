@@ -1,27 +1,33 @@
-//! Echo — the step that sends the mouse somewhere.
+//! Echo — the step that moves the view towards someone.
 //!
-//! Every step before this one read or drew, and being wrong cost a box in the
-//! wrong place. This one moves the view, so being wrong drags someone's aim
-//! off target mid-round. It is therefore the smallest movement that can still
-//! be seen: hold one key and the view turns steadily to the right, at a
-//! constant rate, until the key is let go. Nothing aims at anything.
+//! The first aim assist, and deliberately a raw one. Hold the key and the
+//! view walks onto the nearest enemy in front of you and stays there. It does
+//! not care what your hand is doing: push against it and it pushes back,
+//! every pass, because the thing that yields to the player is the next step
+//! and not this one. That is what raw means here, and it is why the key is
+//! still one the game binds nothing to.
 //!
-//! Two guards, both about not touching what we were not invited to touch:
-//! nothing is sent unless the game is the window in front, and nothing is
-//! sent unless the key is down this instant.
+//! The steering is feedback, not calculation. Each pass asks where the view
+//! is, where it should be, and moves a share of the difference; the next pass
+//! asks again. So nothing has to be exactly right — the number converting
+//! degrees to mouse counts is one machine's sensitivity, and being wrong
+//! about it changes how fast the view arrives, not where.
 //!
-//! The check is the turn readout. Windows moving a pointer would prove only
-//! that Windows moved a pointer — the view angle changing is what says the
-//! counts arrived inside CS2. Hold the key and the figure climbs; let go and
-//! it stops.
+//! Guards, in the order they refuse: the key must be down this instant, the
+//! game must be the window in front, our own reading must be plausible, and
+//! the target must be a living enemy inside a cone around where the player is
+//! already pointing. Each refusal has its own name in the log, because a
+//! reason that is only "nothing happened" is not a reason.
 //!
-//! The hand readout is worth watching while holding it, too — it stays put.
-//! What we inject does not come back through our own raw input, so the counts
-//! there are yours and nothing else. That was measured here, not assumed, and
-//! the step that has to tell the two apart should measure it again.
+//! The check is your eyes and the log together. Point near an enemy, hold the
+//! key: the crosshair should arrive and settle without trembling. The log
+//! says which enemy and how far off, every half second, so a view that walks
+//! away instead of towards is visible as a figure that grows.
 
 use std::time::{Duration, Instant};
 
+use echo::aim;
+use echo::aim::{Offset, Steering};
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
@@ -41,18 +47,40 @@ const PACE_REPORT: Duration = Duration::from_secs(2);
 /// How often a hold in progress is written to the log.
 ///
 /// The totals at the end of an eight-second hold cannot say whether the view
-/// turned steadily or turned for one second and then stopped. Lines along the
+/// moved steadily or moved for one second and then stopped. Lines along the
 /// way can, by subtraction — which is the same mistake as measuring a turn
 /// from its two ends, made about time instead of about angle.
-const NUDGE_REPORT: Duration = Duration::from_millis(500);
+const AIM_REPORT: Duration = Duration::from_millis(500);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-/// Held to send movement. Chosen for being bound to nothing in CS2, so the
-/// only thing that happens while it is down is the thing under test.
-const NUDGE_KEY: VIRTUAL_KEY = VK_INSERT;
-/// Counts sent per frame while that key is held. Small enough that the turn
-/// is a drift rather than a jump — a jump would prove the same thing and be a
-/// much worse thing to be surprised by.
-const NUDGE: i32 = 4;
+/// Held to steer. Still a key the game binds nothing to: this fights the
+/// player's hand rather than yielding to it, so it has no business on a key
+/// anyone presses while playing until the step that fixes that.
+const AIM_KEY: VIRTUAL_KEY = VK_INSERT;
+
+/// How the view is steered.
+///
+/// `counts_per_degree` was measured, not assumed: five holds of about a
+/// thousand counts each, every one landing within a thousandth of 0.0196
+/// degrees a count on the machine it was measured on. That is one player's
+/// sensitivity and not a property of the game, which the feedback loop is
+/// what makes survivable — a share of the remaining distance each pass
+/// arrives wherever the true figure is, only sooner or later.
+const STEERING: Steering = Steering {
+    counts_per_degree: 51.0,
+    gain: 0.35,
+    // Five degrees a pass, which at this rate is a fast flick and not a spin.
+    // What a reading caught mid-write is allowed to cost.
+    cap: 250,
+    deadzone: 0.15,
+    cone: 30.0,
+};
+
+/// How far above a player's feet their eyes are, standing.
+///
+/// Measured rather than guessed: the game's own position readout and the
+/// entity's origin differ by exactly this, which is what said the origin is
+/// feet and the readout is eyes. Anything aiming at a player needs the second.
+const EYE_HEIGHT: f32 = 64.0;
 const ENEMY: COLORREF = rgb(255, 70, 70);
 const TEXT: COLORREF = rgb(235, 235, 235);
 const WARN: COLORREF = rgb(255, 190, 60);
@@ -97,8 +125,8 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     // Bound to the overlay's window, so it is created and dropped with it.
     let mut mouse: Option<RawMouse> = None;
 
-    let mut nudge = Nudge::default();
-    let mut next_nudge = Instant::now();
+    let mut aim = Aim::default();
+    let mut next_aim = Instant::now();
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -155,21 +183,24 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         });
         stages.packets = packets;
 
-        // Read for this step alone, and read here rather than with the others
-        // because it is measured against a movement sent a moment later.
+        // Read last of the readings and just before it is used, because the
+        // movement sent below is measured against it. A pass-old angle steers
+        // towards where the target was relative to where the view was, and
+        // those are two different moments.
         let angles = Stages::time(&mut stages.angles, || game.view_angles())?;
         // Focus is a guard, not a preference. With the game behind something
         // else, the same counts drag the pointer across whatever is in front.
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
-        let before = (nudge.sending, nudge.blocked);
-        Stages::time(&mut stages.nudge, || nudge.send(allowed, angles.yaw));
-        // Both edges of a hold, and nothing in between. The start says where
-        // the view was pointing and the end says what the counts bought —
-        // which is this step's whole evidence, and a readout on a screen that
-        // has since been closed cannot be asked about it afterwards.
-        if (nudge.sending, nudge.blocked) != before || (nudge.sending && started >= next_nudge) {
-            log.record(&nudge.describe());
-            next_nudge = started + NUDGE_REPORT;
+        let before = aim.state();
+        Stages::time(&mut stages.steer, || {
+            aim.steer(allowed, me, &players, angles);
+        });
+        // Every change of state, and then every half second while it lasts.
+        // A single line at the end of a hold cannot say whether the view
+        // walked onto the target or walked away from it.
+        if aim.state() != before || (aim.active && started >= next_aim) {
+            log.record(&aim.describe());
+            next_aim = started + AIM_REPORT;
         }
 
         if let Some(overlay) = overlay.as_mut() {
@@ -185,7 +216,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
                         pace,
                         hand,
                         mouse: mouse.as_ref(),
-                        nudge,
+                        aim,
                     },
                 )
             });
@@ -247,9 +278,10 @@ struct Stages {
     hand: Duration,
     /// Reading the view angle, which is this step's evidence.
     angles: Duration,
-    /// Sending movement. Named separately from everything else because it is
-    /// the one stage whose effect leaves this process.
-    nudge: Duration,
+    /// Choosing a target and sending the movement. Named separately from
+    /// everything else because it is the one stage whose effect leaves this
+    /// process.
+    steer: Duration,
     /// Reading the overlay's own message queue.
     pump: Duration,
     /// Keeping the overlay over the game and on top of it. Asks the window
@@ -297,7 +329,7 @@ impl Stages {
             ("write log", self.log),
             ("read hand", self.hand),
             ("read angles", self.angles),
-            ("send nudge", self.nudge),
+            ("steer", self.steer),
             ("pump messages", self.pump),
             ("follow window", self.follow),
         ]
@@ -418,115 +450,189 @@ impl Pace {
     }
 }
 
-/// Pushing the view sideways while a key is held, and the evidence that it
-/// worked.
+/// Steering the view onto someone while a key is held.
 ///
-/// The counts sent and the angle turned are kept side by side on purpose. One
-/// is what we asked for and the other is what the game did, and this step is
-/// finished when the second answers the first. How much turn a count buys is
-/// a question for the step that has somewhere to aim.
-#[derive(Clone, Copy)]
-struct Nudge {
-    sending: bool,
-    /// Why not, when not. A key held while the game sits behind a browser has
-    /// to read as refused rather than as idle, or the readout makes it look
-    /// as though sending is broken.
+/// Holds no reading of its own. Everything it decides from is passed in, so
+/// what it decides can be reasoned about from the log alone: the same inputs
+/// on the same pass produce the same line.
+#[derive(Clone, Copy, Default)]
+struct Aim {
+    active: bool,
+    /// Held, but the game is not the window in front.
     blocked: bool,
-    /// Counts sent since the key went down.
-    sent: i64,
+    /// Which pawn is being steered towards. In the log so that a target
+    /// swapping back and forth between two enemies is visible as a swap
+    /// rather than as a view that will not settle.
+    target: Option<usize>,
+    offset: Offset,
+    /// Counts sent since the key went down, one figure per axis.
+    sent: [i64; 2],
     /// Sends Windows would not accept. Elevation exists to keep this at zero.
     refused: u64,
-    /// Where the view was pointing at the previous send.
-    previous: ViewAngles,
-    /// The whole turn since the key went down, added up a frame at a time.
+    /// Why nothing is happening, when nothing is happening.
     ///
-    /// Not the difference between where the view started and where it is now.
-    /// Two angles cannot tell a turn of 11 degrees from one of 371, and a log
-    /// recorded exactly that: 3976 counts sent, 11 degrees reported, when the
-    /// counts before it had bought a degree every thirty. One frame's step is
-    /// far too small to be mistaken for a longer one, so adding the steps up
-    /// has no such ceiling.
-    turned: f32,
+    /// Every refusal has its own name. A count that never moves off one of
+    /// them is how a rule that has quietly become impossible shows itself —
+    /// which is the failure the old product carried for fifteen versions
+    /// without anyone noticing.
+    reason: Refusal,
 }
 
-impl Default for Nudge {
-    fn default() -> Self {
-        Self {
-            sending: false,
-            blocked: false,
-            sent: 0,
-            refused: 0,
-            previous: ViewAngles {
-                pitch: 0.0,
-                yaw: 0.0,
-            },
-            turned: 0.0,
+/// What stopped the view from being steered this pass, if anything did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Refusal {
+    #[default]
+    NotHeld,
+    NotInFront,
+    NoLocalPlayer,
+    ViewImplausible,
+    NoPositionForUs,
+    NoEnemyInTheCone,
+    AlreadyOnTarget,
+    WindowsRefused,
+    Steering,
+}
+
+impl Refusal {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotHeld => "idle",
+            Self::NotInFront => "held, but the game is not in front",
+            Self::NoLocalPlayer => "no plausible reading of us",
+            Self::ViewImplausible => "view angles implausible — stale offsets?",
+            Self::NoPositionForUs => "our own position is not readable",
+            Self::NoEnemyInTheCone => "no living enemy in the cone",
+            Self::AlreadyOnTarget => "on target",
+            Self::WindowsRefused => "Windows refused the movement — not elevated?",
+            Self::Steering => "steering",
         }
     }
 }
 
-impl Nudge {
-    fn send(&mut self, allowed: bool, yaw: f32) {
-        let down = input::held(NUDGE_KEY);
-        self.blocked = down && !allowed;
-        let sending = down && allowed;
+impl Aim {
+    /// What the log is keyed on: a line is written when any of this changes.
+    const fn state(&self) -> (bool, bool, Option<usize>, Refusal) {
+        (self.active, self.blocked, self.target, self.reason)
+    }
 
-        let now = ViewAngles { pitch: 0.0, yaw };
-        // Each hold is measured on its own. Carrying the totals across holds
-        // would leave the turn figure describing several presses at once, so
-        // a run of small holds would read as one large one.
-        if sending && !self.sending {
-            self.sent = 0;
-            self.turned = 0.0;
-            // No step on the first frame: there is no earlier reading to
-            // measure one against, and the last hold's would credit this one
-            // with whatever the player did in between.
-            self.previous = now;
+    fn steer(
+        &mut self,
+        allowed: bool,
+        me: Option<LocalPlayer>,
+        players: &[Player],
+        angles: ViewAngles,
+    ) {
+        let held = input::held(AIM_KEY);
+        self.blocked = held && !allowed;
+        let active = held && allowed;
+        // Each hold counts from zero, so the figures describe this press and
+        // not every press since the program started.
+        if active && !self.active {
+            self.sent = [0; 2];
         }
-        self.sending = sending;
-        if !sending {
-            return;
-        }
+        self.active = active;
+        self.target = None;
+        self.offset = Offset::default();
 
-        // Added before this frame's send rather than after it, because what
-        // has moved the view so far is every send before this one. Crediting
-        // a turn to a movement the game has not seen yet would be the readout
-        // agreeing with itself.
-        self.turned += now.turn_from(self.previous);
-        self.previous = now;
+        self.reason = match self.aim_at(active, held, me, players, angles) {
+            Err(refusal) => refusal,
+            Ok(counts) => {
+                if input::move_by(counts[0], counts[1]) {
+                    self.sent[0] += i64::from(counts[0]);
+                    self.sent[1] += i64::from(counts[1]);
+                    Refusal::Steering
+                } else {
+                    self.refused += 1;
+                    Refusal::WindowsRefused
+                }
+            }
+        };
+    }
 
-        if input::move_by(NUDGE, 0) {
-            self.sent += i64::from(NUDGE);
-        } else {
-            self.refused += 1;
+    /// The decision, with every way of declining to make one named.
+    ///
+    /// Separated from the sending so that the reasons read as one list rather
+    /// than as a staircase of early returns with the movement at the bottom.
+    fn aim_at(
+        &mut self,
+        active: bool,
+        held: bool,
+        me: Option<LocalPlayer>,
+        players: &[Player],
+        angles: ViewAngles,
+    ) -> Result<[i32; 2], Refusal> {
+        if !active {
+            return Err(if held {
+                Refusal::NotInFront
+            } else {
+                Refusal::NotHeld
+            });
         }
+        // Our own side is what every enemy test is made against, so a bad
+        // reading of it would make targets of teammates.
+        let me = me
+            .filter(|me| me.plausible())
+            .ok_or(Refusal::NoLocalPlayer)?;
+        if !angles.plausible() {
+            return Err(Refusal::ViewImplausible);
+        }
+        let eye = players
+            .iter()
+            .find(|player| player.pawn == me.pawn)
+            .and_then(|player| player.origin)
+            .map(eyes)
+            .ok_or(Refusal::NoPositionForUs)?;
+
+        // The one nearest to where the player is already pointing. Measured as
+        // an angle rather than as a distance on screen, because a target at
+        // the edge of the view is further away than the same gap in pixels
+        // near the middle, and it is the angle the movement has to cover.
+        let target = players
+            .iter()
+            .filter(|player| {
+                player.pawn != me.pawn
+                    && player.plausible()
+                    && me.team.opposes(player.team)
+                    && player.alive()
+            })
+            .filter_map(|player| {
+                let desired = aim::look_at(eye, eyes(player.origin?))?;
+                let offset = aim::offset(angles, desired);
+                STEERING
+                    .within_cone(offset)
+                    .then_some((player.pawn, offset))
+            })
+            .min_by(|(_, a), (_, b)| a.size().total_cmp(&b.size()));
+
+        let (pawn, offset) = target.ok_or(Refusal::NoEnemyInTheCone)?;
+        self.target = Some(pawn);
+        self.offset = offset;
+        STEERING.counts(offset).ok_or(Refusal::AlreadyOnTarget)
     }
 
     fn describe(&self) -> String {
-        let state = match (self.sending, self.blocked) {
-            (true, _) => "sending",
-            (_, true) => "held, but the game is not in front",
-            _ => "idle",
-        };
-        // The ratio is what the next step needs and what says whether this
-        // one worked: a turn without counts behind it is the player's hand,
-        // and counts without a turn are movement the game never saw.
-        let per_count = if self.sent == 0 {
-            String::new()
-        } else {
-            format!("   {:+.4} deg/count", self.turned / self.sent as f32)
-        };
-        format!(
-            "nudge {state}   sent {} counts   turned {:+.1} deg{per_count}{}",
-            self.sent,
-            self.turned,
-            if self.refused > 0 {
-                format!("   {} refused — not elevated?", self.refused)
-            } else {
-                String::new()
-            }
-        )
+        let mut line = format!("aim {}", self.reason.label());
+        if let Some(pawn) = self.target {
+            line += &format!(
+                "   target 0x{pawn:X}   off {:.2} deg (yaw {:+.2} pitch {:+.2})",
+                self.offset.size(),
+                self.offset.yaw,
+                self.offset.pitch
+            );
+        }
+        if self.sent != [0; 2] {
+            line += &format!("   sent {:+} {:+}", self.sent[0], self.sent[1]);
+        }
+        if self.refused > 0 {
+            line += &format!("   {} refused", self.refused);
+        }
+        line
     }
+}
+
+/// A player's eyes, from the feet their origin records.
+fn eyes(origin: [f32; 3]) -> [f32; 3] {
+    [origin[0], origin[1], origin[2] + EYE_HEIGHT]
 }
 
 /// How tall a standing player is, in world units.
@@ -622,7 +728,7 @@ struct Readouts<'a> {
     pace: Pace,
     hand: [i64; 2],
     mouse: Option<&'a RawMouse>,
-    nudge: Nudge,
+    aim: Aim,
 }
 
 impl Readouts<'_> {
@@ -643,7 +749,7 @@ impl Readouts<'_> {
                 ),
                 None => "no raw mouse".to_owned(),
             },
-            self.nudge.describe(),
+            self.aim.describe(),
         ]
     }
 }
