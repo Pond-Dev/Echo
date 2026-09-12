@@ -4,8 +4,8 @@
 //! view walks onto the nearest enemy in front of you and stays there. It does
 //! not care what your hand is doing: push against it and it pushes back,
 //! every pass, because the thing that yields to the player is the next step
-//! and not this one. That is what raw means here, and it is why the key is
-//! still one the game binds nothing to.
+//! and not this one. That is what raw means here — worth knowing before
+//! holding the button down in a round that matters.
 //!
 //! The steering is feedback, not calculation. Each pass asks where the view
 //! is, where it should be, and moves a share of the difference; the next pass
@@ -34,7 +34,7 @@ use echo::log::Log;
 use echo::overlay::{FrameCost, Overlay, rgb};
 use echo::process::AttachError;
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_INSERT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_XBUTTON2};
 use windows::core::w;
 
 /// Target frame time. The game draws far faster than this, so a box is always
@@ -52,10 +52,17 @@ const PACE_REPORT: Duration = Duration::from_secs(2);
 /// from its two ends, made about time instead of about angle.
 const AIM_REPORT: Duration = Duration::from_millis(500);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-/// Held to steer. Still a key the game binds nothing to: this fights the
-/// player's hand rather than yielding to it, so it has no business on a key
-/// anyone presses while playing until the step that fixes that.
-const AIM_KEY: VIRTUAL_KEY = VK_INSERT;
+/// Held to steer — the fifth mouse button, under the thumb.
+///
+/// Unlike the key this started on, the game sees this press too. It is
+/// unbound in a default install, so nothing happens twice, but a player who
+/// has bound it will get both — which is theirs to decide, not ours to
+/// prevent.
+///
+/// Read straight from the keyboard state rather than from the raw input this
+/// program already receives. The two would disagree on the frame the button
+/// goes down, and the one that matters is the one the game is acting on.
+const AIM_KEY: VIRTUAL_KEY = VK_XBUTTON2;
 
 /// How the view is steered.
 ///
