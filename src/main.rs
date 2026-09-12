@@ -1,178 +1,101 @@
-//! Step 1: attach to CS2 and prove we can read its memory.
+//! Echo — step 2: read the player's view angles live.
 //!
-//! Finds `cs2.exe`, locates `client.dll` inside it, and reads the first two
-//! bytes at the module base. A PE image starts with `MZ`, so seeing it back
-//! proves the whole chain works: process lookup, handle, module enumeration,
-//! and a cross-process read.
+//! Step 1 proved the plumbing (attach, find `client.dll`, read a byte). This
+//! adds the first real game value: where the player is looking. The view
+//! angles sit at a fixed offset with no pointer to follow, which isolates
+//! "is the offset right" from "can we walk a chain".
 //!
-//! No game offsets are involved on purpose — those are a separate problem.
+//! The check is the mouse: move it and the numbers must move with it.
 
-use std::ffi::c_void;
-use std::mem::size_of;
+use std::io::Write;
+use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
-    Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use echo::game::Game;
+use echo::log::Log;
+use echo::process::AttachError;
 
-const GAME_EXE: &str = "cs2.exe";
-const GAME_MODULE: &str = "client.dll";
-
-/// A UTF-16 fixed array as Windows fills it: NUL-terminated, rest is garbage.
-fn wide_to_string(wide: &[u16]) -> String {
-    let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
-    String::from_utf16_lossy(&wide[..end])
-}
-
-fn find_process(name: &str) -> windows::core::Result<Option<u32>> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? };
-    let mut entry = PROCESSENTRY32W {
-        dwSize: size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-
-    let mut found = None;
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
-        loop {
-            if wide_to_string(&entry.szExeFile).eq_ignore_ascii_case(name) {
-                found = Some(entry.th32ProcessID);
-                break;
-            }
-            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
-                break;
-            }
-        }
-    }
-
-    unsafe { CloseHandle(snapshot)? };
-    Ok(found)
-}
-
-/// Base address and size of one loaded module, by name.
-fn find_module(pid: u32, name: &str) -> windows::core::Result<Option<(usize, u32)>> {
-    // A 64-bit target still wants both flags: SNAPMODULE32 is ignored for a
-    // 64-bit process and required for a 32-bit one, so passing both works
-    // either way and costs nothing.
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)? };
-    let mut entry = MODULEENTRY32W {
-        dwSize: size_of::<MODULEENTRY32W>() as u32,
-        ..Default::default()
-    };
-
-    let mut found = None;
-    if unsafe { Module32FirstW(snapshot, &mut entry) }.is_ok() {
-        loop {
-            if wide_to_string(&entry.szModule).eq_ignore_ascii_case(name) {
-                found = Some((entry.modBaseAddr as usize, entry.modBaseSize));
-                break;
-            }
-            if unsafe { Module32NextW(snapshot, &mut entry) }.is_err() {
-                break;
-            }
-        }
-    }
-
-    unsafe { CloseHandle(snapshot)? };
-    Ok(found)
-}
-
-fn read_bytes(process: HANDLE, address: usize, out: &mut [u8]) -> windows::core::Result<usize> {
-    let mut read = 0usize;
-    unsafe {
-        ReadProcessMemory(
-            process,
-            address as *const c_void,
-            out.as_mut_ptr().cast(),
-            out.len(),
-            Some(&mut read),
-        )?;
-    }
-    Ok(read)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::wide_to_string;
-
-    #[test]
-    fn a_name_stops_at_the_terminator_and_ignores_the_garbage_after_it() {
-        let mut buffer = [0u16; 8];
-        for (slot, ch) in buffer.iter_mut().zip("cs2.exe".encode_utf16()) {
-            *slot = ch;
-        }
-        buffer[7] = 0;
-        assert_eq!(wide_to_string(&buffer), "cs2.exe");
-
-        // Windows leaves whatever was in the buffer after the NUL.
-        let mut dirty = buffer;
-        dirty[4] = 0;
-        dirty[5] = u16::from(b'X');
-        assert_eq!(wide_to_string(&dirty), "cs2.");
-    }
-
-    #[test]
-    fn a_full_buffer_with_no_terminator_still_reads_as_a_whole_name() {
-        let full: Vec<u16> = "client.dll".encode_utf16().collect();
-        assert_eq!(wide_to_string(&full), "client.dll");
-    }
-}
+const POLL: Duration = Duration::from_millis(50);
 
 fn main() {
-    let result = run();
-    if let Err(error) = &result {
-        println!("Failed: {error}");
+    let mut log = Log::create();
+    if let Some(path) = log.path() {
+        println!("log: {}", path.display());
+    }
+
+    if let Err(error) = run(&mut log) {
+        log.say(&format!("\nFailed: {error}"));
     }
     wait_before_closing();
 }
 
-fn run() -> windows::core::Result<()> {
-    let Some(pid) = find_process(GAME_EXE)? else {
-        println!("{GAME_EXE} is not running.");
+fn run(log: &mut Log) -> Result<(), AttachError> {
+    let Some(game) = Game::attach()? else {
+        log.say("cs2.exe is running but client.dll has not loaded yet.");
         return Ok(());
     };
-    println!("{GAME_EXE}  pid={pid}");
 
-    // Reading another process needs elevation (or SeDebugPrivilege). Say so
-    // instead of surfacing a bare HRESULT: this is the first wall anyone hits.
-    let process =
-        match unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid) } {
-            Ok(handle) => handle,
-            Err(error) if error.code() == E_ACCESSDENIED => {
-                println!("Cannot open the process: access denied.");
-                println!("Run this from an elevated terminal (Administrator).");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+    let client = game.client();
+    log.say(&format!("cs2.exe      pid={}", game.pid()));
+    log.say(&format!(
+        "client.dll   base=0x{:X}  size={} bytes",
+        client.base, client.size
+    ));
 
-    let result = (|| -> windows::core::Result<()> {
-        let Some((base, size)) = find_module(pid, GAME_MODULE)? else {
-            println!("{GAME_MODULE} is not loaded yet.");
-            return Ok(());
-        };
-        println!("{GAME_MODULE}  base=0x{base:X}  size={size} bytes");
+    if !game.client_looks_like_a_module()? {
+        log.say("\nNo PE signature at the module base — attached to the wrong thing.");
+        return Ok(());
+    }
 
-        let mut header = [0u8; 2];
-        let read = read_bytes(process, base, &mut header)?;
-        println!("read {read} bytes at base: {header:02X?}  ({:?})", {
-            let printable: String = header.iter().map(|&b| b as char).collect();
-            printable
-        });
+    log.say("\nMove your mouse — pitch and yaw should follow it.");
+    log.say("Ctrl+C to stop.\n");
 
-        if &header == b"MZ" {
-            println!("\nPE signature matches. Attach and cross-process read both work.");
+    let mut stdout = std::io::stdout();
+    let mut was_plausible = true;
+    let mut last_logged = None;
+    loop {
+        let angles = game.view_angles()?;
+        let plausible = angles.plausible();
+
+        if plausible {
+            print!(
+                "\r  pitch {:>7.2}    yaw {:>8.2}          ",
+                angles.pitch, angles.yaw
+            );
         } else {
-            println!("\nExpected 'MZ' at the module base. Something is wrong.");
+            print!(
+                "\r  implausible: pitch {} yaw {} — the offset is probably stale  ",
+                angles.pitch, angles.yaw
+            );
         }
-        Ok(())
-    })();
+        let _ = stdout.flush();
 
-    unsafe { CloseHandle(process)? };
-    result
+        // The console is a live readout; the log is a history. Only the log
+        // keeps every sample, and a change of verdict is called out because
+        // that is the line worth finding afterwards.
+        if plausible != was_plausible {
+            log.record(if plausible {
+                "--- readings became plausible ---"
+            } else {
+                "--- readings became implausible: stale offset? ---"
+            });
+            was_plausible = plausible;
+        }
+        // Only changes are worth a line. A still mouse produces the same
+        // reading twenty times a second, and recording that says the clock is
+        // running, not that anything happened. The console already shows the
+        // loop is alive.
+        if last_logged != Some(angles) {
+            log.record(&format!(
+                "pitch={:.3} yaw={:.3}{}",
+                angles.pitch,
+                angles.yaw,
+                if plausible { "" } else { "  IMPLAUSIBLE" }
+            ));
+            last_logged = Some(angles);
+        }
+
+        std::thread::sleep(POLL);
+    }
 }
 
 /// Double-clicking a console binary closes the window the moment it returns,

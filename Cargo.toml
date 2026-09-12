@@ -3,5 +3,16 @@ name = "echo"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "echo"
+path = "src/lib.rs"
+
+# A thin shell over the library. `test = false` because the binary carries the
+# elevation manifest, and a test harness built from it cannot be launched.
+[[bin]]
+name = "echo"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_Foundation"] }
