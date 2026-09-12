@@ -15,4 +15,5 @@
 pub mod console;
 pub mod game;
 pub mod log;
+pub mod overlay;
 pub mod process;

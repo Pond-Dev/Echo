@@ -1,25 +1,29 @@
-//! Echo — step 4: walk the entity table and find the other players.
+//! Echo — step 5: draw on top of the game.
 //!
-//! Steps two and three read one value and then one pointer. This walks a
-//! table: sixty-four controller slots, each holding a handle to the pawn that
-//! player is currently driving, each pawn reached through a chunk table. Most
-//! slots are empty, most handles name nothing, and both are ordinary.
+//! Four steps of reading memory end here; this one puts something on screen.
+//! An always-on-top, click-through window is laid over the game's client area
+//! and a border, a centre marker and a few lines of text are drawn into it.
 //!
-//! Nothing is cached between passes. Step three's log showed a pawn address
-//! changing three times across one death and respawn, so every pass re-reads
-//! the chunk pointers as well as the entities in them.
+//! Nothing drawn comes from the world yet — that is step 6. What this proves
+//! is that the window lands in the right place, that the game shows through
+//! everywhere we did not draw, and that the mouse still reaches the game.
 //!
-//! The check is the scoreboard: the players listed here, their sides and their
-//! health should match it.
+//! The check is your eyes: the border should hug the picture, the marker
+//! should sit around the game's own crosshair, and shooting should still work.
 
 use std::time::Duration;
 
 use echo::console::Screen;
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles};
 use echo::log::Log;
+use echo::overlay::{Overlay, rgb};
 use echo::process::AttachError;
+use windows::core::w;
 
 const POLL: Duration = Duration::from_millis(100);
+const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
+const ACCENT: windows::Win32::Foundation::COLORREF = rgb(0, 220, 120);
+const TEXT: windows::Win32::Foundation::COLORREF = rgb(235, 235, 235);
 
 fn main() {
     let mut log = Log::create();
@@ -53,6 +57,12 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     }
 
     let screen = Screen::new();
+    let mut overlay = Overlay::over(GAME_WINDOW)?;
+    match &overlay {
+        Some(overlay) => log.record(&format!("overlay over {:?}", overlay.bounds())),
+        None => log.record("no game window — the overlay will not be shown"),
+    }
+
     let mut last_logged = None;
     loop {
         let angles = game.view_angles()?;
@@ -63,6 +73,14 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         players.sort_by_key(|player| rank(*player, me));
 
         screen.draw(&frame(&game, angles, me, &players));
+
+        if let Some(overlay) = overlay.as_mut() {
+            overlay.pump();
+            if overlay.target_is_alive() {
+                overlay.follow_target();
+                draw_overlay(overlay, angles, me, &players);
+            }
+        }
 
         // The log records the roster, not the movement. Fourteen players
         // walking around change their positions every single pass, and a file
@@ -79,6 +97,48 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
 
         std::thread::sleep(POLL);
     }
+}
+
+/// Step 5 draws nothing derived from the world yet — that is step 6. What it
+/// proves is that the window is in the right place, that the game shows
+/// through it, and that it does not eat the mouse.
+fn draw_overlay(
+    overlay: &Overlay,
+    angles: ViewAngles,
+    me: Option<LocalPlayer>,
+    players: &[Player],
+) {
+    let bounds = overlay.bounds();
+    overlay.frame(|canvas| {
+        // A border on the client area. If this hugs the picture, the overlay
+        // is aligned; if it is off, the sizing is wrong and every box drawn
+        // later would be wrong the same way.
+        canvas.rect(0, 0, bounds.width - 1, bounds.height - 1, ACCENT, 1);
+
+        // Centre marker. The game's own crosshair should sit inside it.
+        let (cx, cy) = (bounds.width / 2, bounds.height / 2);
+        canvas.line((cx - 12, cy), (cx - 4, cy), ACCENT, 1);
+        canvas.line((cx + 4, cy), (cx + 12, cy), ACCENT, 1);
+        canvas.line((cx, cy - 12), (cx, cy - 4), ACCENT, 1);
+        canvas.line((cx, cy + 4), (cx, cy + 12), ACCENT, 1);
+
+        let enemies = players
+            .iter()
+            .filter(|p| me.is_some_and(|me| me.team.opposes(p.team)) && p.alive())
+            .count();
+        let status = [
+            format!("echo  {}x{}", bounds.width, bounds.height),
+            format!("pitch {:.1}  yaw {:.1}", angles.pitch, angles.yaw),
+            match me {
+                Some(me) => format!("{} health {}", me.team.label(), me.health),
+                None => "no pawn".to_owned(),
+            },
+            format!("{} players, {enemies} enemies alive", players.len()),
+        ];
+        for (row, line) in status.iter().enumerate() {
+            canvas.text(12, 12 + row as i32 * 18, line, TEXT);
+        }
+    });
 }
 
 /// Sort key: enemies, then teammates, then the rest.
