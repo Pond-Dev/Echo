@@ -1,10 +1,15 @@
 //! Echo — closing the angle, once.
 //!
-//! Hold the button and the view is pulled towards the nearest enemy in front
-//! of you. The moment it is anywhere inside them the pull is finished and the
-//! last of it is yours, and it stays yours until the button is let go and
-//! pressed again. One press, one pull. Move the mouse during it and the grip
-//! eases off; it never has to be let go of first, and it never argues.
+//! Fire, and the view is pulled towards the nearest enemy in front of you.
+//! The moment it is anywhere inside them the pull is finished and the last of
+//! it is yours, and it stays yours until the trigger is let go and pressed
+//! again. One press, one pull. Move the mouse during it and the grip eases
+//! off; it never has to be let go of first, and it never argues.
+//!
+//! On the trigger, so the first bullet is always unhelped — the game fires on
+//! the press, and nothing outside it moves the view before that. And nothing
+//! here knows what is in the player's hands, so a grenade, a knife or a click
+//! in the buy menu pull the view exactly as a rifle does.
 //!
 //! That rule is asked again every pass, and it is never told that a hold has
 //! begun. Both matter. The product this one replaces decided at the moment of
@@ -39,7 +44,7 @@ use echo::log::Log;
 use echo::overlay::{FrameCost, Overlay, rgb};
 use echo::process::AttachError;
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_XBUTTON2};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_LBUTTON};
 use windows::core::w;
 
 /// Target frame time. The game draws far faster than this, so a box is always
@@ -57,17 +62,26 @@ const PACE_REPORT: Duration = Duration::from_secs(2);
 /// from its two ends, made about time instead of about angle.
 const AIM_REPORT: Duration = Duration::from_millis(500);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-/// Held to steer — the fifth mouse button, under the thumb.
+/// Held to steer — the trigger.
 ///
-/// Unlike the key this started on, the game sees this press too. It is
-/// unbound in a default install, so nothing happens twice, but a player who
-/// has bound it will get both — which is theirs to decide, not ours to
-/// prevent.
+/// Which makes the pull part of shooting rather than something done before
+/// it, and only works at all because the pull now ends once: an assist that
+/// held on through the trigger would be fighting the recoil the player is
+/// compensating by hand, which is the failure recorded as K1.
+///
+/// **The first bullet can never be helped.** The game fires on the press and
+/// nothing outside it can move the view before that; the pull begins after
+/// the shot has left. What it reaches is the second bullet onwards.
+///
+/// **Nothing here knows what is in the player's hands.** A grenade is thrown
+/// by releasing this button, so the pull lands in the middle of a lineup;
+/// a knife and a click in the buy menu do the same. Reading the active
+/// weapon is its own step and this wants it.
 ///
 /// Read straight from the keyboard state rather than from the raw input this
 /// program already receives. The two would disagree on the frame the button
 /// goes down, and the one that matters is the one the game is acting on.
-const AIM_KEY: VIRTUAL_KEY = VK_XBUTTON2;
+const AIM_KEY: VIRTUAL_KEY = VK_LBUTTON;
 
 const ENEMY: COLORREF = rgb(255, 70, 70);
 const TEXT: COLORREF = rgb(235, 235, 235);
