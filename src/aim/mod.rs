@@ -455,13 +455,17 @@ pub struct Situation<'a> {
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
     pub angles: ViewAngles,
-    /// Whether the pull has already finished during this press.
+    /// Who the pull of this press has already been spent on, if anyone.
     ///
     /// Held by the caller because it belongs to the press and not to the
     /// pass. Nothing in here may set it — that would be this deciding when a
     /// press began, which is the one thing the yielding rule is built not to
     /// know.
-    pub delivered: bool,
+    ///
+    /// Who, rather than whether, only so that the log can tell a press whose
+    /// pull landed from one whose target died under it and was replaced. The
+    /// press still gets one pull either way.
+    pub delivered_to: Option<usize>,
 }
 
 /// What the assist decided, and why.
@@ -596,7 +600,17 @@ impl Steering {
         // the angle is closed and the rest is the player's, and it stays
         // theirs until they let the button go — which is the caller's to
         // remember, since nothing here may know what a press is.
-        if now.delivered || choice.arrived {
+        if let Some(spent_on) = now.delivered_to {
+            // Whoever it was spent on, it is spent. The two are told apart
+            // only so that a line saying the angle was closed is not written
+            // about somebody the pull never touched.
+            return Err(if spent_on == pawn {
+                Refusal::Delivered
+            } else {
+                Refusal::PullSpent
+            });
+        }
+        if choice.arrived {
             return Err(Refusal::Delivered);
         }
 
@@ -646,6 +660,7 @@ pub enum Refusal {
     HandWins,
     Easing,
     Delivered,
+    PullSpent,
     WindowsRefused,
     Steering,
 }
@@ -668,6 +683,7 @@ impl Refusal {
         Self::HandWins,
         Self::Easing,
         Self::Delivered,
+        Self::PullSpent,
         Self::WindowsRefused,
         Self::Steering,
     ];
@@ -676,7 +692,7 @@ impl Refusal {
     ///
     /// Written out rather than taken from the roll call, so that the two have
     /// to be made to agree instead of one silently following the other.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     /// Which slot of the tally this one is counted in.
     ///
@@ -699,6 +715,7 @@ impl Refusal {
             Self::HandWins => 8,
             Self::Easing => 9,
             Self::Delivered => 10,
+            Self::PullSpent => 13,
             Self::WindowsRefused => 11,
             Self::Steering => 12,
         }
@@ -718,6 +735,7 @@ impl Refusal {
             Self::NoEnemyInTheCone => "no-enemy",
             Self::HandWins => "hand",
             Self::Delivered => "delivered",
+            Self::PullSpent => "pull-spent",
             Self::WindowsRefused => "windows-refused",
             Self::Steering => "steering",
         }
@@ -736,6 +754,7 @@ impl Refusal {
             Self::NoEnemyInTheCone => "no living enemy in the cone",
             Self::HandWins => "your hand",
             Self::Delivered => "delivered — the rest is yours",
+            Self::PullSpent => "this press has had its pull, on someone else",
             Self::WindowsRefused => "Windows refused the movement — not elevated?",
             Self::Steering => "steering",
         }
@@ -1208,7 +1227,7 @@ mod tests {
                 pitch: 0.0,
                 yaw: 0.0,
             },
-            delivered: false,
+            delivered_to: None,
         }
     }
 
@@ -1373,12 +1392,21 @@ mod tests {
             "far enough off to be worth a pull"
         );
 
-        now.delivered = true;
+        now.delivered_to = Some(0x2000);
         let choice = STEERING.choose(&now, 1.0, 0.0);
         assert_eq!(choice.counts, Err(Refusal::Delivered));
         // Still says who, so a line about it can be read afterwards.
         assert_eq!(choice.target, Some(0x2000));
         assert!(!choice.arrived, "and does not claim to have just arrived");
+
+        // And a press whose pull went to somebody else says so rather than
+        // claiming to have closed an angle it never touched — which a log of
+        // a target dying mid-press had it doing, over two hundred units out.
+        now.delivered_to = Some(0x9999);
+        assert_eq!(
+            STEERING.choose(&now, 1.0, 0.0).counts,
+            Err(Refusal::PullSpent)
+        );
     }
 
     #[test]
@@ -1437,26 +1465,37 @@ mod tests {
         // A player stands seventy-two units tall and the pull aims at the
         // chest, so the circle must not reach the top of the head or the
         // ground, nor further out than the shoulders.
-        let reach = STEERING.settle_within;
-        assert!(
-            STEERING.aim_height + reach < 72.0,
-            "the circle reaches over the head"
+        // Held as compile-time assertions rather than checked at run time:
+        // they are about two constants and a shape, so there is no moment
+        // worth discovering them at later than the build.
+        //
+        // A standing player is seventy-two units tall with their eyes at
+        // sixty-four, and the pull may come to rest anywhere within
+        // `settle_within` of where it aims.
+        const HEIGHT: f32 = 72.0;
+        const EYES: f32 = 64.0;
+        // The pull comes to rest at that distance rather than staying inside
+        // it, so the distance needs room in the torso rather than filling it.
+        // Set to a torso's half-width it parks on the outline: a session's
+        // sixty-eight deliveries had a median miss of ten units against a
+        // boundary of twelve, which is an arm.
+        const TORSO_HALF_WIDTH: f32 = 12.0;
+
+        const _: () = assert!(
+            STEERING.aim_height + STEERING.settle_within < HEIGHT,
+            "the circle the pull may stop in reaches over the head"
         );
-        assert!(STEERING.aim_height - reach > 0.0, "and into the ground");
-        assert!(
-            STEERING.aim_height < 64.0,
+        const _: () = assert!(
+            STEERING.aim_height - STEERING.settle_within > 0.0,
+            "and into the ground"
+        );
+        const _: () = assert!(
+            STEERING.aim_height < EYES,
             "aiming at or above the eyes is aiming at the head"
         );
-
-        // And with room to spare, because the pull comes to rest at this
-        // distance rather than staying inside it. Set to a torso's half-width
-        // it parks on the outline of the torso; a session's sixty-eight
-        // deliveries had a median miss of ten units against a boundary of
-        // twelve, which is an arm.
-        const TORSO_HALF_WIDTH: f32 = 12.0;
-        assert!(
-            reach <= TORSO_HALF_WIDTH / 2.0,
-            "the pull rests {reach} units off centre, on a torso half {TORSO_HALF_WIDTH} wide"
+        const _: () = assert!(
+            STEERING.settle_within * 2.0 <= TORSO_HALF_WIDTH,
+            "the pull rests on the outline of the torso rather than inside it"
         );
     }
 

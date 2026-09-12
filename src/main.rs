@@ -493,12 +493,12 @@ struct Aim {
     /// be read as a length on a chest rather than as an angle, which cannot
     /// be read at all without it.
     distance: f32,
-    /// Whether the pull has finished during this press.
+    /// Who this press's pull was spent on, if anyone.
     ///
     /// Belongs to the press, so it lives here rather than in the deciding —
     /// which is never told that a press began, and must not be, since that is
     /// the one thing the old product decided on and got wrong for years.
-    delivered: bool,
+    delivered_to: Option<usize>,
     /// Whether the mouse could be read at all this pass. Kept for the
     /// readout, because a run where it never can is one where nothing works
     /// and the reason is one line at startup otherwise.
@@ -557,7 +557,7 @@ impl Aim {
             self.offset = Offset::default();
             self.passes = 0;
             self.pushed = 0;
-            self.delivered = false;
+            self.delivered_to = None;
         }
         self.active = active;
 
@@ -577,7 +577,7 @@ impl Aim {
         // the next press has to earn it back from nothing like any other.
         let grip = self
             .grip
-            .update(active && !self.delivered, push, elapsed, RAMP);
+            .update(active && self.delivered_to.is_none(), push, elapsed, RAMP);
         if active {
             self.passes += 1;
             self.pushed += u32::from(push > 0.0);
@@ -591,7 +591,7 @@ impl Aim {
                 me,
                 players,
                 angles,
-                delivered: self.delivered,
+                delivered_to: self.delivered_to,
             },
             grip,
             push,
@@ -608,7 +608,9 @@ impl Aim {
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
         // which is the tracking this deliberately does not do.
-        self.delivered |= choice.arrived;
+        if choice.arrived {
+            self.delivered_to = self.delivered_to.or(choice.target);
+        }
         let reason = match choice.counts {
             Err(refusal) => refusal,
             Ok(counts) => {
