@@ -13,6 +13,23 @@
 //! number that converts degrees into mouse counts can be well off before the
 //! behaviour changes from "arrives quickly" to "arrives slowly".
 //!
+//! It closes the angle once and then stops. The view is pulled towards the
+//! target's head, and the moment it is anywhere inside the target's body the
+//! pull is finished and the last of it belongs to the player — until the
+//! button is let go and pressed again. That is a choice about the game this
+//! is for: a CS2 duel is decided by where the first bullet goes, spray
+//! patterns are learned by hand and an assist holding through one is fighting
+//! what the player practised, and inaccuracy while moving keeps duels down to
+//! a few hundred milliseconds. There is no long window to track through.
+//!
+//! Handing over at the width of the body rather than the width of the head is
+//! the difference the whole product is named for. A pull that ends on the
+//! head has done the aiming; a pull that ends on the body has closed the
+//! angle and left the aiming. It also needs no rule about distance: the body
+//! subtends less angle the further away it is, so the further the shot — the
+//! harder it is, and the more obvious an assist would be — the less this
+//! touches.
+//!
 //! Nothing in here switches on or off. Every edge is a curve, in both of the
 //! places an edge would otherwise be felt. A movement asked for approaches
 //! its ceiling instead of striking it, so there is no distance at which the
@@ -115,6 +132,14 @@ pub struct Steering {
     /// onto the air above their head and hold it there. Read the pawn's own
     /// view offset when that starts to matter.
     pub eye_height: f32,
+    /// Half the width of a player, in world units.
+    ///
+    /// What the pull is finished at, as an angle worked out against the
+    /// target's distance rather than fixed: a body is nearly two degrees
+    /// wide at five hundred units and half of one at two thousand, and a
+    /// single angle would mean handing over short of the target up close and
+    /// well past it at range.
+    pub body_half_width: f32,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
     ///
@@ -182,6 +207,7 @@ pub const STEERING: Steering = Steering {
     // accelerating and starts coasting.
     cap: 250.0,
     deadzone: 0.15,
+    body_half_width: 16.0,
     eye_height: 64.0,
     cone: 30.0,
 };
@@ -379,6 +405,13 @@ pub struct Situation<'a> {
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
     pub angles: ViewAngles,
+    /// Whether the pull has already finished during this press.
+    ///
+    /// Held by the caller because it belongs to the press and not to the
+    /// pass. Nothing in here may set it — that would be this deciding when a
+    /// press began, which is the one thing the yielding rule is built not to
+    /// know.
+    pub delivered: bool,
 }
 
 /// What the assist decided, and why.
@@ -387,6 +420,9 @@ pub struct Choice {
     /// when nothing was sent, so a refusal can say who it was about.
     pub target: Option<usize>,
     pub offset: Offset,
+    /// Whether the view is inside the target this pass — the moment the pull
+    /// is finished. The caller latches it for the rest of the press.
+    pub arrived: bool,
     /// The movement to send, or the reason there is none.
     pub counts: Result<[i32; 2], Refusal>,
 }
@@ -401,10 +437,27 @@ impl Steering {
         let mut choice = Choice {
             target: None,
             offset: Offset::default(),
+            arrived: false,
             counts: Err(Refusal::NotHeld),
         };
-        choice.counts = self.decide(now, grip, push, &mut choice.target, &mut choice.offset);
+        choice.counts = self.decide(now, grip, push, &mut choice);
         choice
+    }
+
+    /// The angle a target of this distance is handed over at.
+    ///
+    /// Never under the deadzone, which is the width below which a movement is
+    /// a tremble rather than aim. At the distances a CS2 map allows, the body
+    /// is wider than that everywhere, so the floor is a guard and not a rule
+    /// anyone will meet.
+    pub fn handover(self, distance: f32) -> f32 {
+        if !distance.is_finite() || distance <= 0.0 {
+            return self.deadzone;
+        }
+        (self.body_half_width / distance)
+            .atan()
+            .to_degrees()
+            .max(self.deadzone)
     }
 
     fn decide(
@@ -412,8 +465,7 @@ impl Steering {
         now: &Situation<'_>,
         grip: f32,
         push: f32,
-        chosen: &mut Option<usize>,
-        chosen_offset: &mut Offset,
+        choice: &mut Choice,
     ) -> Result<[i32; 2], Refusal> {
         if !now.held {
             return Err(Refusal::NotHeld);
@@ -458,7 +510,7 @@ impl Steering {
         // as an angle rather than as a distance on screen, because a target
         // at the edge of the view is further away than the same gap in pixels
         // near the middle, and it is the angle the movement has to cover.
-        let (pawn, offset) = now
+        let (pawn, offset, distance) = now
             .players
             .iter()
             .filter(|player| {
@@ -468,28 +520,37 @@ impl Steering {
                     && player.alive()
             })
             .filter_map(|player| {
-                let desired = look_at(eye, self.eyes(player.origin?))?;
+                let head = self.eyes(player.origin?);
+                let desired = look_at(eye, head)?;
                 let at = offset(now.angles, desired);
-                self.within_cone(at).then_some((player.pawn, at))
+                self.within_cone(at)
+                    .then_some((player.pawn, at, apart(eye, head)))
             })
-            .min_by(|(_, a), (_, b)| a.size().total_cmp(&b.size()))
+            .min_by(|(_, a, _), (_, b, _)| a.size().total_cmp(&b.size()))
             .ok_or(Refusal::NoEnemyInTheCone)?;
 
-        // Recorded before the last refusal rather than after it, so a line
+        // Recorded before the last refusals rather than after them, so a line
         // about the player taking the view back can still say which enemy it
         // was taken from.
-        *chosen = Some(pawn);
-        *chosen_offset = offset;
+        choice.target = Some(pawn);
+        choice.offset = offset;
+        choice.arrived = offset.size() <= self.handover(distance);
+
+        // The pull is one pull. Once the view is anywhere inside the target
+        // the angle is closed and the rest is the player's, and it stays
+        // theirs until they let the button go — which is the caller's to
+        // remember, since nothing here may know what a press is.
+        if now.delivered || choice.arrived {
+            return Err(Refusal::Delivered);
+        }
 
         self.counts(offset, grip).ok_or({
-            // Nothing to send means three different things, and calling them
-            // all one thing quietly spoiled the count the tuning rests on:
-            // the view is there already, the player has taken it, or the grip
-            // is simply too low yet to round to a movement — which happens on
-            // every rise and has nothing to do with the hand.
-            if offset.size() < self.deadzone {
-                Refusal::AlreadyOnTarget
-            } else if push > 0.0 {
+            // Nothing to send means two different things: the player has
+            // taken the view, or the grip is simply too low yet to round to a
+            // movement — which happens on every rise and has nothing to do
+            // with the hand. Calling them one thing quietly spoiled the count
+            // the tuning rests on.
+            if push > 0.0 {
                 Refusal::HandWins
             } else {
                 Refusal::Easing
@@ -501,6 +562,12 @@ impl Steering {
     fn eyes(self, origin: [f32; 3]) -> [f32; 3] {
         [origin[0], origin[1], origin[2] + self.eye_height]
     }
+}
+
+/// How far apart two places are.
+fn apart(from: [f32; 3], to: [f32; 3]) -> f32 {
+    let [x, y, z] = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    x.hypot(y).hypot(z)
 }
 
 /// What stopped the view from being steered this pass, if anything did.
@@ -517,7 +584,7 @@ pub enum Refusal {
     NoEnemyInTheCone,
     HandWins,
     Easing,
-    AlreadyOnTarget,
+    Delivered,
     WindowsRefused,
     Steering,
 }
@@ -539,7 +606,7 @@ impl Refusal {
         Self::NoEnemyInTheCone,
         Self::HandWins,
         Self::Easing,
-        Self::AlreadyOnTarget,
+        Self::Delivered,
         Self::WindowsRefused,
         Self::Steering,
     ];
@@ -570,7 +637,7 @@ impl Refusal {
             Self::NoEnemyInTheCone => 7,
             Self::HandWins => 8,
             Self::Easing => 9,
-            Self::AlreadyOnTarget => 10,
+            Self::Delivered => 10,
             Self::WindowsRefused => 11,
             Self::Steering => 12,
         }
@@ -589,16 +656,10 @@ impl Refusal {
             Self::NoPositionForUs => "no-position",
             Self::NoEnemyInTheCone => "no-enemy",
             Self::HandWins => "hand",
-            Self::AlreadyOnTarget => "on-target",
+            Self::Delivered => "delivered",
             Self::WindowsRefused => "windows-refused",
             Self::Steering => "steering",
         }
-    }
-
-    /// Whether the view is being held on a target. Moving onto one and
-    /// sitting on one are the same thing from outside.
-    pub const fn engaged(self) -> bool {
-        matches!(self, Self::Steering | Self::AlreadyOnTarget)
     }
 
     pub const fn label(self) -> &'static str {
@@ -613,7 +674,7 @@ impl Refusal {
             Self::NoPositionForUs => "our own position is not readable",
             Self::NoEnemyInTheCone => "no living enemy in the cone",
             Self::HandWins => "your hand",
-            Self::AlreadyOnTarget => "on target",
+            Self::Delivered => "delivered — the rest is yours",
             Self::WindowsRefused => "Windows refused the movement — not elevated?",
             Self::Steering => "steering",
         }
@@ -635,6 +696,7 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
+            body_half_width: 16.0,
             eye_height: 64.0,
             cone: 30.0,
         }
@@ -1084,6 +1146,7 @@ mod tests {
                 pitch: 0.0,
                 yaw: 0.0,
             },
+            delivered: false,
         }
     }
 
@@ -1203,16 +1266,60 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_send_says_which_of_the_three_it_was() {
-        // Level with us, so that adding the same eye height to both leaves
-        // the view exactly on them.
+    fn the_pull_ends_the_moment_the_view_is_anywhere_inside_the_target() {
+        // Level with us, so adding the same eye height to both leaves the
+        // view exactly on them.
         let dead_ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
-        assert_eq!(
-            STEERING.choose(&situation(&dead_ahead), 1.0, 0.0).counts,
-            Err(Refusal::AlreadyOnTarget),
-            "the view is there already"
+        let choice = STEERING.choose(&situation(&dead_ahead), 1.0, 0.0);
+        assert!(choice.arrived);
+        assert_eq!(choice.counts, Err(Refusal::Delivered));
+
+        // Half a degree off at a thousand units is still well inside a body,
+        // which is what the handover is measured against — not the head, and
+        // not the fraction of a degree that stops a tremble.
+        let nearly = facing_east(&[enemy(0x2000, [1000.0, 8.0, 0.0])]);
+        let choice = STEERING.choose(&situation(&nearly), 1.0, 0.0);
+        assert!(choice.arrived, "off by {:.2} deg", choice.offset.size());
+    }
+
+    #[test]
+    fn what_counts_as_inside_the_target_shrinks_with_the_distance_to_it() {
+        // A fixed angle would hand over short of a target up close and well
+        // past one at range. These are the widths a player subtends.
+        let close = STEERING.handover(500.0);
+        let far = STEERING.handover(2000.0);
+        assert!((close - 1.83).abs() < 0.05, "{close}");
+        assert!((far - 0.46).abs() < 0.05, "{far}");
+        assert!(close > far);
+
+        // And never under the width that stops a tremble, however far away.
+        assert!(STEERING.handover(1e9) >= STEERING.deadzone);
+        assert!(STEERING.handover(f32::NAN) >= STEERING.deadzone);
+        assert!(STEERING.handover(0.0) >= STEERING.deadzone);
+    }
+
+    #[test]
+    fn once_it_has_been_handed_over_it_stays_handed_over() {
+        // The target walks away afterwards. Nothing follows: this press has
+        // closed the angle it was pressed to close.
+        let walked_off = facing_east(&[enemy(0x2000, [1000.0, 300.0, 0.0])]);
+        let mut now = situation(&walked_off);
+        assert!(now.hand.is_some());
+        assert!(
+            STEERING.choose(&now, 1.0, 0.0).counts.is_ok(),
+            "far enough off to be worth a pull"
         );
 
+        now.delivered = true;
+        let choice = STEERING.choose(&now, 1.0, 0.0);
+        assert_eq!(choice.counts, Err(Refusal::Delivered));
+        // Still says who, so a line about it can be read afterwards.
+        assert_eq!(choice.target, Some(0x2000));
+        assert!(!choice.arrived, "and does not claim to have just arrived");
+    }
+
+    #[test]
+    fn nothing_to_send_says_which_of_the_two_it_was() {
         let off_to_one_side = facing_east(&[enemy(0x2000, [1000.0, 200.0, 0.0])]);
         assert_eq!(
             STEERING

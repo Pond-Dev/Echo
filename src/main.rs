@@ -1,9 +1,10 @@
-//! Echo — the step where the player's hand wins.
+//! Echo — closing the angle, once.
 //!
-//! Hold the button and the view walks onto the nearest enemy in front of you
-//! and stays there. Move the mouse and it lets go, that pass, and stays out
-//! of the way until your hand is still again. It never has to be let go of
-//! first, and it never argues.
+//! Hold the button and the view is pulled towards the nearest enemy in front
+//! of you. The moment it is anywhere inside them the pull is finished and the
+//! last of it is yours, and it stays yours until the button is let go and
+//! pressed again. One press, one pull. Move the mouse during it and the grip
+//! eases off; it never has to be let go of first, and it never argues.
 //!
 //! That rule is asked again every pass, and it is never told that a hold has
 //! begun. Both matter. The product this one replaces decided at the moment of
@@ -474,6 +475,12 @@ struct Aim {
     /// rebuilt, because what it knows is where along the ramp it has got to
     /// and that does not belong to any one pass.
     grip: Grip,
+    /// Whether the pull has finished during this press.
+    ///
+    /// Belongs to the press, so it lives here rather than in the deciding —
+    /// which is never told that a press began, and must not be, since that is
+    /// the one thing the old product decided on and got wrong for years.
+    delivered: bool,
     /// Whether the mouse could be read at all this pass. Kept for the
     /// readout, because a run where it never can is one where nothing works
     /// and the reason is one line at startup otherwise.
@@ -503,18 +510,13 @@ struct Aim {
 impl Aim {
     /// What the log is keyed on: a line is written when any of this changes.
     ///
-    /// Steering towards a target and sitting on one collapse together here.
-    /// They differ by whether the offset is over the deadzone this instant,
-    /// and a target on foot crosses it several times a second — which wrote
-    /// three hundred and forty-seven lines for fifteen seconds of play and
-    /// buried everything worth reading in them.
+    /// Steering and sitting on a target used to be collapsed together here,
+    /// because a target on foot crossed the line between them several times a
+    /// second and wrote three hundred and forty-seven lines for fifteen
+    /// seconds of play. Handing over once a press removed the crossing rather
+    /// than papering over it, so there is nothing left to collapse.
     const fn state(&self) -> (bool, bool, Option<usize>, Refusal) {
-        let reason = if self.reason.engaged() {
-            Refusal::Steering
-        } else {
-            self.reason
-        };
-        (self.active, self.blocked, self.target, reason)
+        (self.active, self.blocked, self.target, self.reason)
     }
 
     fn steer(
@@ -537,6 +539,7 @@ impl Aim {
             self.offset = Offset::default();
             self.passes = 0;
             self.pushed = 0;
+            self.delivered = false;
         }
         self.active = active;
 
@@ -552,7 +555,11 @@ impl Aim {
         // it alone while the button is up would have a second press seize the
         // view at whatever the first one ended on.
         self.hand_readable = hand.is_some();
-        let grip = self.grip.update(active, push, elapsed, RAMP);
+        // Delivered counts as not engaged, so the grip decays afterwards and
+        // the next press has to earn it back from nothing like any other.
+        let grip = self
+            .grip
+            .update(active && !self.delivered, push, elapsed, RAMP);
         if active {
             self.passes += 1;
             self.pushed += u32::from(push > 0.0);
@@ -566,6 +573,7 @@ impl Aim {
                 me,
                 players,
                 angles,
+                delivered: self.delivered,
             },
             grip,
             push,
@@ -578,6 +586,10 @@ impl Aim {
             self.target = choice.target;
             self.offset = choice.offset;
         }
+        // Latched, never unlatched until the next press. Asking again each
+        // pass would hand the view back the instant the target moved off it,
+        // which is the tracking this deliberately does not do.
+        self.delivered |= choice.arrived;
         let reason = match choice.counts {
             Err(refusal) => refusal,
             Ok(counts) => {
