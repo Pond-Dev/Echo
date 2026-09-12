@@ -13,6 +13,8 @@
 //! number that converts degrees into mouse counts can be well off before the
 //! behaviour changes from "arrives quickly" to "arrives slowly".
 
+use std::time::Duration;
+
 use crate::game::ViewAngles;
 
 /// How far the view is from where it should be, on each axis.
@@ -133,6 +135,70 @@ fn clamp_counts(counts: f32, cap: i32) -> i32 {
         counts.round()
     };
     (rounded as i32).clamp(-cap, cap)
+}
+
+/// When the player takes the view back.
+#[derive(Clone, Copy, Debug)]
+pub struct Yield {
+    /// Counts in one pass at or above which the hand is moving on purpose.
+    ///
+    /// A hand at rest does not report a small number — it reports nothing at
+    /// all. Eight seconds with the hand off the mouse delivered no packets,
+    /// measured, so this only has to sit under the smallest movement anyone
+    /// makes on purpose rather than above some noise floor.
+    pub moving: i64,
+    /// How long the hand must be still before the assist steers again.
+    ///
+    /// Yielding is immediate and coming back is not, and the asymmetry is the
+    /// point: without it the assist returns between two packets of a movement
+    /// still in progress and fights the second half of it.
+    pub settle: Duration,
+}
+
+/// Whether the player is driving.
+///
+/// Asked again every pass, and never reset when the button goes down. Both
+/// matter, and the second is the more expensive to get wrong: the product
+/// this one replaces decided at the moment of the press, so pressing while
+/// the hand was moving — which is what every player does — skipped the whole
+/// hold. It was measured happening six times in every thirty seconds of play,
+/// and it is what "I pressed and nothing grabbed" was.
+///
+/// Here a hand that is moving when the button goes down costs the settle time
+/// and nothing more. The assist arrives late; it does not fail to arrive.
+#[derive(Clone, Copy, Debug)]
+pub struct Hand {
+    still_for: Duration,
+}
+
+impl Default for Hand {
+    fn default() -> Self {
+        // A hand nobody has touched has been still for as long as you like.
+        // Starting from zero would mean the assist could not work until the
+        // settle time had passed after the program started, which is a rule
+        // about nothing.
+        Self {
+            still_for: Duration::MAX,
+        }
+    }
+}
+
+impl Hand {
+    /// Whether the player has the view this pass, so nothing may be sent.
+    ///
+    /// `elapsed` is passed in rather than measured, so the rule can be tested
+    /// without waiting for a clock.
+    pub fn wins(&mut self, counts: [i64; 2], elapsed: Duration, rule: Yield) -> bool {
+        // Per axis, not combined: a movement that is purely vertical is as
+        // deliberate as one that is not, and adding the two would let a
+        // diagonal of two small movements count as one large one.
+        if counts[0].abs().max(counts[1].abs()) >= rule.moving {
+            self.still_for = Duration::ZERO;
+            return true;
+        }
+        self.still_for = self.still_for.saturating_add(elapsed);
+        self.still_for < rule.settle
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +362,76 @@ mod tests {
             }),
             None
         );
+    }
+
+    const PASS: Duration = Duration::from_millis(8);
+
+    fn yielding() -> Yield {
+        Yield {
+            moving: 2,
+            settle: Duration::from_millis(120),
+        }
+    }
+
+    #[test]
+    fn a_hand_at_rest_leaves_the_view_to_the_assist() {
+        let mut hand = Hand::default();
+        for _ in 0..100 {
+            assert!(!hand.wins([0, 0], PASS, yielding()));
+        }
+        // And a movement below the threshold is still rest.
+        assert!(!hand.wins([1, -1], PASS, yielding()));
+    }
+
+    #[test]
+    fn a_hand_that_moves_takes_the_view_on_that_very_pass() {
+        let mut hand = Hand::default();
+        assert!(hand.wins([2, 0], PASS, yielding()), "sideways");
+        let mut hand = Hand::default();
+        assert!(hand.wins([0, -2], PASS, yielding()), "and vertically");
+    }
+
+    #[test]
+    fn the_assist_waits_for_the_hand_to_settle_rather_than_returning_mid_movement() {
+        let mut hand = Hand::default();
+        assert!(hand.wins([40, 0], PASS, yielding()));
+
+        // A flick arrives as packets with gaps between them. Coming back in
+        // one of those gaps would fight the second half of the movement.
+        let mut still = Duration::ZERO;
+        loop {
+            let wins = hand.wins([0, 0], PASS, yielding());
+            // Counted after the call, because what the rule weighs is the
+            // stillness including this pass — the same quantity, counted from
+            // the same moment.
+            still += PASS;
+            if still < yielding().settle {
+                assert!(wins, "came back after only {still:?}");
+            } else {
+                assert!(!wins, "still waiting after {still:?}");
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_hand_moving_when_the_button_goes_down_costs_the_settle_time_and_no_more() {
+        // The failure this replaces: deciding at the moment of the press, so
+        // pressing mid-movement skipped the entire hold. Nothing here is told
+        // that a hold began, which is what makes that impossible rather than
+        // merely avoided.
+        let mut hand = Hand::default();
+        assert!(
+            hand.wins([30, 5], PASS, yielding()),
+            "mid-flick, button down"
+        );
+
+        let mut still = Duration::ZERO;
+        while hand.wins([0, 0], PASS, yielding()) {
+            still += PASS;
+            assert!(still < Duration::from_secs(1), "never came back");
+        }
+        assert!(still <= yielding().settle + PASS, "took {still:?}");
     }
 
     #[test]

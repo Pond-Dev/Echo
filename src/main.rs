@@ -1,11 +1,16 @@
-//! Echo — the step that moves the view towards someone.
+//! Echo — the step where the player's hand wins.
 //!
-//! The first aim assist, and deliberately a raw one. Hold the key and the
-//! view walks onto the nearest enemy in front of you and stays there. It does
-//! not care what your hand is doing: push against it and it pushes back,
-//! every pass, because the thing that yields to the player is the next step
-//! and not this one. That is what raw means here — worth knowing before
-//! holding the button down in a round that matters.
+//! Hold the button and the view walks onto the nearest enemy in front of you
+//! and stays there. Move the mouse and it lets go, that pass, and stays out
+//! of the way until your hand is still again. It never has to be let go of
+//! first, and it never argues.
+//!
+//! That rule is asked again every pass, and it is never told that a hold has
+//! begun. Both matter. The product this one replaces decided at the moment of
+//! the press, so pressing while the hand was moving — which is what everyone
+//! does — skipped the entire hold; it was measured happening six times in
+//! every thirty seconds of play. Here the same press costs the settle time
+//! and nothing else.
 //!
 //! The steering is feedback, not calculation. Each pass asks where the view
 //! is, where it should be, and moves a share of the difference; the next pass
@@ -27,7 +32,7 @@
 use std::time::{Duration, Instant};
 
 use echo::aim;
-use echo::aim::{Offset, Steering};
+use echo::aim::{Hand, Offset, Steering, Yield};
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
@@ -80,6 +85,18 @@ const STEERING: Steering = Steering {
     cap: 250,
     deadzone: 0.15,
     cone: 30.0,
+};
+
+/// When the player takes the view back.
+///
+/// Both figures are first guesses, and the log records how much of every hold
+/// the hand took so they can be replaced by a reading off a real session
+/// rather than by a better guess. Two counts in a pass is around four degrees
+/// a second at the sensitivity this was measured on — under any deliberate
+/// adjustment, and above a hand at rest, which reports nothing whatsoever.
+const YIELD: Yield = Yield {
+    moving: 2,
+    settle: Duration::from_millis(120),
 };
 
 /// How far above a player's feet their eyes are, standing.
@@ -200,7 +217,10 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
         let before = aim.state();
         Stages::time(&mut stages.steer, || {
-            aim.steer(allowed, me, &players, angles);
+            // One pass stale, since the period is closed at the end of a
+            // pass and this is the middle of the next. A few hundred
+            // microseconds against a settle measured in tens of milliseconds.
+            aim.steer(allowed, me, &players, angles, hand, pace.period);
         });
         // Every change of state, and then every half second while it lasts.
         // A single line at the end of a hold cannot say whether the view
@@ -476,6 +496,17 @@ struct Aim {
     sent: [i64; 2],
     /// Sends Windows would not accept. Elevation exists to keep this at zero.
     refused: u64,
+    /// Whether the player is driving. Asked every pass, held here rather than
+    /// rebuilt, because what it knows is how long the hand has been still and
+    /// that does not belong to any one pass.
+    hand: Hand,
+    /// Passes this hold, and how many of them the hand took.
+    ///
+    /// The share is what says whether the rule for yielding is set anywhere
+    /// near right. A hold the hand takes all of is an assist that never helps;
+    /// one it takes none of is an assist that never lets go.
+    passes: u32,
+    yielded: u32,
     /// Why nothing is happening, when nothing is happening.
     ///
     /// Every refusal has its own name. A count that never moves off one of
@@ -495,6 +526,7 @@ enum Refusal {
     ViewImplausible,
     NoPositionForUs,
     NoEnemyInTheCone,
+    HandWins,
     AlreadyOnTarget,
     WindowsRefused,
     Steering,
@@ -515,6 +547,7 @@ impl Refusal {
             Self::ViewImplausible => "view angles implausible — stale offsets?",
             Self::NoPositionForUs => "our own position is not readable",
             Self::NoEnemyInTheCone => "no living enemy in the cone",
+            Self::HandWins => "your hand",
             Self::AlreadyOnTarget => "on target",
             Self::WindowsRefused => "Windows refused the movement — not elevated?",
             Self::Steering => "steering",
@@ -545,7 +578,15 @@ impl Aim {
         me: Option<LocalPlayer>,
         players: &[Player],
         angles: ViewAngles,
+        hand: [i64; 2],
+        elapsed: Duration,
     ) {
+        // Asked first and asked unconditionally, so that what it knows is how
+        // long the hand has really been still. Asking only while the button is
+        // down would have it believe a hand that had been moving the whole
+        // time between two holds was resting.
+        let hand_wins = self.hand.wins(hand, elapsed, YIELD);
+
         let held = input::held(AIM_KEY);
         self.blocked = held && !allowed;
         let active = held && allowed;
@@ -555,10 +596,16 @@ impl Aim {
             self.sent = [0; 2];
             self.target = None;
             self.offset = Offset::default();
+            self.passes = 0;
+            self.yielded = 0;
         }
         self.active = active;
+        if active {
+            self.passes += 1;
+            self.yielded += u32::from(hand_wins);
+        }
 
-        self.reason = match self.aim_at(active, held, me, players, angles) {
+        self.reason = match self.aim_at(active, held, me, players, angles, hand_wins) {
             Err(refusal) => refusal,
             Ok(counts) => {
                 if input::move_by(counts[0], counts[1]) {
@@ -584,6 +631,7 @@ impl Aim {
         me: Option<LocalPlayer>,
         players: &[Player],
         angles: ViewAngles,
+        hand_wins: bool,
     ) -> Result<[i32; 2], Refusal> {
         if !active {
             // Returning before the target is cleared, on purpose: the line
@@ -637,6 +685,12 @@ impl Aim {
         let (pawn, offset) = target.ok_or(Refusal::NoEnemyInTheCone)?;
         self.target = Some(pawn);
         self.offset = offset;
+        // Last, and after the target is recorded, so the log can say which
+        // enemy the view was on when the player took it back. Refusing before
+        // the search would save the search and lose the reason.
+        if hand_wins {
+            return Err(Refusal::HandWins);
+        }
         STEERING.counts(offset).ok_or(Refusal::AlreadyOnTarget)
     }
 
@@ -652,6 +706,9 @@ impl Aim {
         }
         if self.sent != [0; 2] {
             line += &format!("   sent {:+} {:+}", self.sent[0], self.sent[1]);
+        }
+        if let Some(share) = (self.yielded * 100).checked_div(self.passes) {
+            line += &format!("   hand {share}% of {} passes", self.passes);
         }
         if self.refused > 0 {
             line += &format!("   {} refused", self.refused);
