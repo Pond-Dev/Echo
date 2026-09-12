@@ -14,21 +14,29 @@
 //! behaviour changes from "arrives quickly" to "arrives slowly".
 //!
 //! It closes the angle once and then stops. The view is pulled towards the
-//! target's head, and the moment it is anywhere inside the target's body the
-//! pull is finished and the last of it belongs to the player — until the
-//! button is let go and pressed again. That is a choice about the game this
+//! target's chest, and the moment it is anywhere inside them the pull is
+//! finished and the last of it belongs to the player — until the button is
+//! let go and pressed again. That is a choice about the game this
 //! is for: a CS2 duel is decided by where the first bullet goes, spray
 //! patterns are learned by hand and an assist holding through one is fighting
 //! what the player practised, and inaccuracy while moving keeps duels down to
 //! a few hundred milliseconds. There is no long window to track through.
 //!
-//! Handing over at the width of the body rather than the width of the head is
-//! the difference the whole product is named for. A pull that ends on the
-//! head has done the aiming; a pull that ends on the body has closed the
-//! angle and left the aiming. It also needs no rule about distance: the body
-//! subtends less angle the further away it is, so the further the shot — the
-//! harder it is, and the more obvious an assist would be — the less this
-//! touches.
+//! Handing over anywhere on the body rather than on the head is the
+//! difference the whole product is named for. A pull that ends on the head
+//! has done the aiming; a pull that ends on the chest has closed the angle
+//! and left the aiming — the shot connects, and whether it kills is still the
+//! player's. It also needs no rule about distance: a body subtends less angle
+//! the further away it is, so the further the shot — the harder it is, and
+//! the more obvious an assist would be — the less this touches.
+//!
+//! The point aimed at and the width handed over at have to describe the same
+//! shape, and once did not. The pull aimed at the head and handed over at the
+//! width of the body, so it would stop a body's half-width to one side of a
+//! head — which is air, since a player is only as wide as their shoulders
+//! down at the chest and far narrower at the head. A log caught it exactly:
+//! fifteen presses in three seconds, every one answered "delivered" without
+//! moving anything, every one a degree and a bit off.
 //!
 //! Nothing in here switches on or off. Every edge is a curve, in both of the
 //! places an edge would otherwise be felt. A movement asked for approaches
@@ -120,25 +128,47 @@ pub struct Steering {
     /// trades one rounding error for another, every pass, which is a tremble
     /// rather than aim.
     pub deadzone: f32,
-    /// How far above a player's feet their eyes are, standing.
+    /// How far above our own feet our own camera is, standing.
     ///
-    /// Measured rather than guessed: the game's own position readout and the
-    /// entity's origin differ by exactly this, which is what said the origin
-    /// is feet and the readout is eyes.
+    /// Where the pull is measured *from*, and a fact about the game rather
+    /// than a decision: the game's own position readout and the entity's
+    /// origin differ by exactly this, which is what said the origin is feet
+    /// and the readout is eyes.
     ///
-    /// ponytail: standing only. A crouched player's eyes are about eighteen
-    /// units lower, which at three hundred units is three and a half degrees
-    /// — far outside the deadzone, so the assist would settle confidently
-    /// onto the air above their head and hold it there. Read the pawn's own
-    /// view offset when that starts to matter.
+    /// ponytail: standing only. Crouched it is about eighteen units lower.
+    /// Read the pawn's own view offset when that starts to matter.
     pub eye_height: f32,
-    /// Half the width of a player, in world units.
+    /// How far above a target's feet the pull aims, standing.
+    ///
+    /// Where the pull is measured *to*, and a decision rather than a fact —
+    /// which is why it is a separate figure from the one above even though
+    /// both are heights above a pair of feet. The two were one for a while
+    /// and the pull aimed at heads.
+    ///
+    /// The chest. Together with the handover width it makes a circle that
+    /// lies inside the body wherever it stops, so a shot at the moment of
+    /// handover connects. Aiming at the head cannot: the head sits at the top
+    /// of the body, so half the circle around it is over the shoulders and
+    /// into the sky.
+    ///
+    /// It also means the assist never hands the player a headshot. Closing
+    /// the angle until the shot connects is help; putting the crosshair on
+    /// the head is doing the aiming, and the product is named for the
+    /// difference.
+    pub aim_height: f32,
+    /// Half the width of the part of a player a bullet registers on.
     ///
     /// What the pull is finished at, as an angle worked out against the
-    /// target's distance rather than fixed: a body is nearly two degrees
-    /// wide at five hundred units and half of one at two thousand, and a
-    /// single angle would mean handing over short of the target up close and
-    /// well past it at range.
+    /// target's distance rather than fixed: a body is over a degree wide at
+    /// five hundred units and a third of one at two thousand, and a single
+    /// angle would mean handing over short of the target up close and well
+    /// past it at range.
+    ///
+    /// ponytail: an estimate. A standing player's bounding box is thirty-two
+    /// units across, but the person inside it is narrower than the box, so
+    /// handing over at the box's half-width parks the view on an edge where a
+    /// shot grazes or misses. Twelve is a guess at the shoulders. Replace it
+    /// with the real hitbox geometry, which the old product already has.
     pub body_half_width: f32,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
@@ -207,8 +237,9 @@ pub const STEERING: Steering = Steering {
     // accelerating and starts coasting.
     cap: 250.0,
     deadzone: 0.15,
-    body_half_width: 16.0,
+    body_half_width: 12.0,
     eye_height: 64.0,
+    aim_height: 55.0,
     cone: 30.0,
 };
 
@@ -531,11 +562,11 @@ impl Steering {
                     && player.alive()
             })
             .filter_map(|player| {
-                let head = self.eyes(player.origin?);
-                let desired = look_at(eye, head)?;
+                let chest = self.aim_point(player.origin?);
+                let desired = look_at(eye, chest)?;
                 let at = offset(now.angles, desired);
                 self.within_cone(at)
-                    .then_some((player.pawn, at, apart(eye, head)))
+                    .then_some((player.pawn, at, apart(eye, chest)))
             })
             .min_by(|(_, a, _), (_, b, _)| a.size().total_cmp(&b.size()))
             .ok_or(Refusal::NoEnemyInTheCone)?;
@@ -569,9 +600,14 @@ impl Steering {
         })
     }
 
-    /// A player's eyes, from the feet their origin records.
+    /// Our own camera, from the feet our origin records.
     fn eyes(self, origin: [f32; 3]) -> [f32; 3] {
         [origin[0], origin[1], origin[2] + self.eye_height]
+    }
+
+    /// The place on a target the pull aims at.
+    fn aim_point(self, origin: [f32; 3]) -> [f32; 3] {
+        [origin[0], origin[1], origin[2] + self.aim_height]
     }
 }
 
@@ -707,8 +743,9 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
-            body_half_width: 16.0,
+            body_half_width: 12.0,
             eye_height: 64.0,
+            aim_height: 55.0,
             cone: 30.0,
         }
     }
@@ -1285,10 +1322,10 @@ mod tests {
         assert!(choice.arrived);
         assert_eq!(choice.counts, Err(Refusal::Delivered));
 
-        // Half a degree off at a thousand units is still well inside a body,
-        // which is what the handover is measured against — not the head, and
-        // not the fraction of a degree that stops a tremble.
-        let nearly = facing_east(&[enemy(0x2000, [1000.0, 8.0, 0.0])]);
+        // A third of a degree off at a thousand units is still inside a
+        // body, which is what the handover is measured against — not the
+        // fraction of a degree that stops a tremble.
+        let nearly = facing_east(&[enemy(0x2000, [1000.0, 5.0, 0.0])]);
         let choice = STEERING.choose(&situation(&nearly), 1.0, 0.0);
         assert!(choice.arrived, "off by {:.2} deg", choice.offset.size());
     }
@@ -1299,8 +1336,8 @@ mod tests {
         // past one at range. These are the widths a player subtends.
         let close = STEERING.handover(500.0);
         let far = STEERING.handover(2000.0);
-        assert!((close - 1.83).abs() < 0.05, "{close}");
-        assert!((far - 0.46).abs() < 0.05, "{far}");
+        assert!((close - 1.38).abs() < 0.05, "{close}");
+        assert!((far - 0.34).abs() < 0.05, "{far}");
         assert!(close > far);
 
         // And never under the width that stops a tremble, however far away.
@@ -1372,6 +1409,43 @@ mod tests {
         let pass = Duration::from_millis(8).as_secs_f32();
         assert!(pass < RAMP.rise.as_secs_f32() / 4.0);
         assert!(pass < RAMP.fall.as_secs_f32() / 4.0);
+    }
+
+    #[test]
+    fn wherever_the_pull_stops_is_somewhere_a_bullet_would_land() {
+        // The defect this is here for: aiming at the head and handing over at
+        // the width of a body stops half the time in the sky above the
+        // shoulders. The circle the pull may stop anywhere inside has to lie
+        // inside the body, so the point it is centred on and the width of it
+        // have to describe the same shape.
+        //
+        // A player stands seventy-two units tall and the pull aims at the
+        // chest, so the circle must not reach the top of the head or the
+        // ground, nor further out than the shoulders.
+        let reach = STEERING.body_half_width;
+        assert!(
+            STEERING.aim_height + reach < 72.0,
+            "the circle reaches over the head"
+        );
+        assert!(STEERING.aim_height - reach > 0.0, "and into the ground");
+        assert!(
+            STEERING.aim_height < 64.0,
+            "aiming at or above the eyes is aiming at the head"
+        );
+    }
+
+    #[test]
+    fn the_pull_aims_at_a_target_lower_than_it_measures_from() {
+        // Two heights that were one figure while the pull aimed at heads. One
+        // is where our own camera is, which the game decides; the other is
+        // where we aim on someone else, which we do.
+        assert_ne!(STEERING.eye_height, STEERING.aim_height);
+
+        // Level ground, a thousand units away: the pull is downwards, because
+        // it aims below its own eye.
+        let ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
+        let choice = STEERING.choose(&situation(&ahead), 1.0, 0.0);
+        assert!(choice.offset.pitch > 0.0, "{:?}", choice.offset);
     }
 
     #[test]
