@@ -19,3 +19,4 @@ pub mod input;
 pub mod log;
 pub mod overlay;
 pub mod process;
+pub mod recoil;

@@ -548,7 +548,19 @@ pub struct Situation<'a> {
     pub hand: Option<[i64; 2]>,
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
-    pub angles: ViewAngles,
+    /// Where the player pointed, as the game stores it.
+    ///
+    /// What is checked for being a real reading — the engine clamps this and
+    /// nothing else, so it is the only one whose bounds mean anything.
+    pub view: ViewAngles,
+    /// Where a shot would go once the compensation lands: the view, plus what
+    /// the gun has added to it, plus what is about to be taken back.
+    ///
+    /// What the geometry works from. Two fields rather than one because they
+    /// are two different things and using the first for the second was the
+    /// aim planning from a number that is wrong for the whole of every spray
+    /// — the view angle sits perfectly still while the shots climb.
+    pub aimed: ViewAngles,
     /// How much of this press the assist has been live for.
     ///
     /// Not how long the button has been down: the passes the player had the
@@ -664,7 +676,7 @@ impl Steering {
         if !me.alive() {
             return Err(Refusal::NotAlive);
         }
-        if !now.angles.plausible() {
+        if !now.view.plausible() {
             return Err(Refusal::ViewImplausible);
         }
         let eye = now
@@ -691,7 +703,7 @@ impl Steering {
             .filter_map(|player| {
                 let chest = self.aim_point(player.origin?);
                 let desired = look_at(eye, chest)?;
-                let at = offset(now.angles, desired);
+                let at = offset(now.aimed, desired);
                 self.within_cone(at)
                     .then_some((player.pawn, at, apart(eye, chest)))
             })
@@ -1410,7 +1422,11 @@ mod tests {
             hand: Some([0, 0]),
             me: Some(us()),
             players,
-            angles: ViewAngles {
+            view: ViewAngles {
+                pitch: 0.0,
+                yaw: 0.0,
+            },
+            aimed: ViewAngles {
                 pitch: 0.0,
                 yaw: 0.0,
             },
@@ -1443,7 +1459,7 @@ mod tests {
             (Refusal::NotAlive, |now| {
                 now.me = Some(LocalPlayer { health: 0, ..us() });
             }),
-            (Refusal::ViewImplausible, |now| now.angles.pitch = 400.0),
+            (Refusal::ViewImplausible, |now| now.view.pitch = 400.0),
             (Refusal::NoPositionForUs, |now| now.players = &[]),
         ];
         ways.into_iter()
@@ -1534,6 +1550,33 @@ mod tests {
         let players = facing_east(&[close_and_wide, far_and_ahead]);
         let choice = STEERING.choose(&situation(&players), ramp(), 1.0, 0.0);
         assert_eq!(choice.target, Some(0x3000));
+    }
+
+    #[test]
+    fn the_aim_plans_from_where_a_shot_would_go_and_not_from_where_the_view_points() {
+        // The failure the product before this one recorded, and the reason
+        // the two are separate fields. A gun throwing the aim upwards leaves
+        // the view angle perfectly still, so an aim working from the view
+        // angle sees no error at all — while every shot climbs — and then
+        // corrects the same kick the compensation is already cancelling.
+        let ahead = facing_east(&[enemy(0x2000, [1000.0, 0.0, 9.0])]);
+
+        let level = STEERING.choose(&situation(&ahead), ramp(), 1.0, 0.0);
+        assert!(level.arrived, "on target with nothing in the way");
+
+        // Same view angle, same target, and the gun has thrown the aim five
+        // degrees up. Nothing about the reading has changed.
+        let mut kicked = situation(&ahead);
+        kicked.aimed = ViewAngles {
+            pitch: -5.0,
+            yaw: 0.0,
+        };
+        let during = STEERING.choose(&kicked, ramp(), 1.0, 0.0);
+        assert!(
+            !during.arrived,
+            "the shot is five degrees high and this said it was on target"
+        );
+        assert!(during.offset.pitch > 1.0, "{:?}", during.offset);
     }
 
     #[test]

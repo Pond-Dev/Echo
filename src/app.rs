@@ -43,6 +43,7 @@ use crate::input::{self, RawMouse};
 use crate::log::Log;
 use crate::overlay::{FrameCost, Overlay, rgb};
 use crate::process::AttachError;
+use crate::recoil::{self, Correction, Recoil};
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_LBUTTON};
 use windows::core::w;
@@ -54,6 +55,28 @@ const FRAME: Duration = Duration::from_millis(8);
 const ATTACH_RETRY: Duration = Duration::from_millis(500);
 /// How often the achieved rate is written to the log.
 const PACE_REPORT: Duration = Duration::from_secs(2);
+/// How much of the gun's kick to take back.
+///
+/// A whole one on the climb is not the same as doing all the work — what the
+/// player's own pull covers is taken off before anything goes out, so a
+/// player who compensates perfectly gets nothing added.
+///
+/// Sideways is held back. The climb is steady and a hand can learn it; the
+/// wander reverses several times through a spray, which is the part a hand is
+/// worst at and also the part that looks least like a person when it is
+/// cancelled exactly. Half is a guess, and the log records what the spray
+/// actually did so the guess can be replaced by a reading.
+const RECOIL: recoil::Control = recoil::Control {
+    vertical: 1.0,
+    sideways: 0.5,
+    // A third of what is left each pass: a shot's step is paid across the gap
+    // before the next shot rather than in the pass it lands on.
+    pace: 0.3,
+    counts_per_degree: STEERING.counts_per_degree,
+    // The same ceiling the aim works under, for the same reason.
+    cap: STEERING.cap,
+};
+
 /// The most one pass may charge to a pull's budget.
 ///
 /// The period a pass reads is the last completed one, so a stall would charge
@@ -180,6 +203,7 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
     let mut before: Vec<Player> = Vec::new();
     let mut landed: Option<Instant> = None;
     let mut last_punch: Option<(Punch, i32)> = None;
+    let mut recoil = Recoil::default();
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -254,13 +278,52 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
         // Focus is a guard, not a preference. With the game behind something
         // else, the same counts drag the pointer across whatever is in front.
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
+
+        // Before anything that aims, and this order is not a preference
+        // either. Whatever aims has to see the view as it will be once this
+        // lands, or both cancel the same kick — the aim reads the punch as
+        // error and corrects it, and this corrects it too. The product before
+        // this one folded recoil in after the controller and got exactly
+        // that: twice the correction, and a shake at the firing rate.
+        let correction = Stages::time(&mut stages.recoil, || match punch {
+            Some((punch, _)) if allowed && !watching => {
+                let correction = recoil.settle(punch, hand.unwrap_or([0; 2]), RECOIL);
+                if !correction.sends_nothing()
+                    && !input::move_by(correction.counts[0], correction.counts[1])
+                {
+                    // Nothing went out. A debt recorded as paid when it was
+                    // not is short by exactly that much for the rest of the
+                    // spray, and silently.
+                    recoil.refused(correction);
+                    return Correction::default();
+                }
+                correction
+            }
+            Some((punch, _)) if watching => recoil.settle(punch, hand.unwrap_or([0; 2]), RECOIL),
+            _ => {
+                recoil.forget();
+                Correction::default()
+            }
+        });
         let was = aim.state();
         Stages::time(&mut stages.steer, || {
+            // Where a shot would go if it left now, and where it would go
+            // once the compensation lands: the view angle, plus what the gun
+            // has added, plus what is about to be taken back. The aim works
+            // from this rather than from the view angle, which is steady
+            // through a spray while the shots climb.
+            let aimed = ViewAngles {
+                pitch: angles.pitch
+                    + punch.map_or(0.0, |(punch, _)| punch.pitch)
+                    + correction.moves.pitch,
+                yaw: angles.yaw + punch.map_or(0.0, |(punch, _)| punch.yaw) + correction.moves.yaw,
+            };
             aim.steer(
                 allowed,
                 me,
                 &players,
                 angles,
+                aimed,
                 Tick {
                     // One pass stale, since the period is closed at the end
                     // of a pass and this is the middle of the next. A few
@@ -298,10 +361,13 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
                     || (now.size() - was.size()).abs() > 0.15;
                 if worth_saying {
                     log.record(&format!(
-                        "punch pitch {:+.3} yaw {:+.3} ({:.3} deg)   shot {shots}{}",
+                        "punch pitch {:+.3} yaw {:+.3} ({:.3} deg)   shot {shots}   \
+                         taken back {:+.2} {:+.2}{}",
                         now.pitch,
                         now.yaw,
                         now.size(),
+                        recoil.paid().pitch,
+                        recoil.paid().yaw,
                         if now.plausible() {
                             ""
                         } else {
@@ -430,6 +496,8 @@ struct Stages {
     angles: Duration,
     /// Reading what the gun has done to the aim.
     punch: Duration,
+    /// Working out and sending the compensation for it.
+    recoil: Duration,
     /// Choosing a target and sending the movement. Named separately from
     /// everything else because it is the one stage whose effect leaves this
     /// process.
@@ -479,7 +547,7 @@ impl Stages {
     /// is then measured against a frame that is too short, so they all read
     /// high, and the missing one reads as more than the whole frame. The log
     /// printed `read hand 3.183 ms 228.1%` before this was one list.
-    fn rows(self) -> [(&'static str, Duration); 11] {
+    fn rows(self) -> [(&'static str, Duration); 12] {
         [
             ("read players", self.players),
             ("draw overlay", self.overlay),
@@ -489,6 +557,7 @@ impl Stages {
             ("read hand", self.hand),
             ("read angles", self.angles),
             ("read punch", self.punch),
+            ("take back recoil", self.recoil),
             ("steer", self.steer),
             ("pump messages", self.pump),
             ("follow window", self.follow),
@@ -733,7 +802,8 @@ impl Aim {
         allowed: bool,
         me: Option<LocalPlayer>,
         players: &[Player],
-        angles: ViewAngles,
+        view: ViewAngles,
+        aimed: ViewAngles,
         tick: Tick,
     ) {
         let Tick { elapsed, hand } = tick;
@@ -790,7 +860,8 @@ impl Aim {
                 hand,
                 me,
                 players,
-                angles,
+                view,
+                aimed,
                 delivered_to: self.delivered_to,
                 pulling_for: self.pulled_for,
             },
