@@ -13,14 +13,17 @@
 //! worth less than refusing to run.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
 const FILE_NAME: &str = "echo.log";
 
 pub struct Log {
-    file: Option<File>,
+    /// Buffered, because this is written from the middle of the frame loop
+    /// and an unbuffered file is one write into the kernel per line. A report
+    /// is fifteen lines; a roster change is one per player.
+    file: Option<BufWriter<File>>,
     started: Instant,
     path: Option<PathBuf>,
 }
@@ -31,7 +34,10 @@ impl Log {
         let path = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(FILE_NAME)));
-        let file = path.as_ref().and_then(|path| File::create(path).ok());
+        let file = path
+            .as_ref()
+            .and_then(|path| File::create(path).ok())
+            .map(BufWriter::new);
         Self {
             file,
             started: Instant::now(),
@@ -75,6 +81,9 @@ impl Log {
             // A failed write means the log is gone, not that the run stops.
             let _ = writeln!(file, "[{elapsed:9.3}] {line}");
         }
+        // Once per record rather than once per line, and still before
+        // returning: a crash must not take the last thing written with it,
+        // which is the whole reason to read this file at all.
         let _ = file.flush();
     }
 }
@@ -104,7 +113,9 @@ mod tests {
     fn console_padding_never_reaches_the_file_as_blank_or_split_lines() {
         let file = std::env::temp_dir().join("echo-log-padding-test.log");
         let mut log = Log {
-            file: Some(std::fs::File::create(&file).expect("temp log")),
+            file: Some(std::io::BufWriter::new(
+                std::fs::File::create(&file).expect("temp log"),
+            )),
             started: std::time::Instant::now(),
             path: Some(file.clone()),
         };

@@ -13,11 +13,10 @@
 //! focus. The overlay never takes focus — it could not, it is click-through —
 //! so without that flag nothing would ever be delivered.
 //!
-//! **Nothing acts on these counts, and that is deliberate.** They are read and
-//! shown so that the reading itself is known to work, and no decision consults
-//! them. Wiring them in is its own step, taken when there is output for them
-//! to yield to; until then a module that fed a decision nothing would read as
-//! a missing connection rather than a choice.
+//! These counts are now the whole of how the assist knows to let go. Anything
+//! that changes what reaches [`take`](RawMouse::take) — the drain, its bound,
+//! when it is called — changes when the player gets the view back, which is
+//! not a property anyone would look for in a module about reading a mouse.
 
 use std::mem::size_of;
 
@@ -29,7 +28,9 @@ use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
-use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_INPUT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DefWindowProcW, MSG, PM_REMOVE, PeekMessageW, WM_INPUT,
+};
 
 /// The player's mouse, as the device reports it.
 pub struct RawMouse {
@@ -99,9 +100,26 @@ impl RawMouse {
                 break;
             }
             self.absorb(HRAWINPUT(message.lParam.0 as *mut _));
+            // Taken out of the queue by hand, so the cleanup the window
+            // procedure would have done never happens unless it is done here.
+            // The documentation asks for this and gives no way to tell that
+            // it was skipped.
+            unsafe {
+                DefWindowProcW(
+                    message.hwnd,
+                    message.message,
+                    message.wParam,
+                    message.lParam,
+                );
+            }
         }
         // Packets we could not read are not counted by `absorb`, so this is
-        // what arrived and was understood, not what the queue held.
+        // what arrived and was understood, not what the queue held. Anything
+        // past the bound is left for the overlay's own pump, which removes
+        // and discards it — a burst larger than the bound is hand movement
+        // that never reaches the assist. It takes a quarter of a second of
+        // backlog at a thousand packets a second to reach, and a pass that
+        // long has worse problems.
         (self.packets - drained) as u32
     }
 

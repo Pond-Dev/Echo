@@ -156,20 +156,26 @@ fn soften(counts: f32, cap: f32, grip: f32) -> i32 {
 /// How the strength the assist steers with rises and falls.
 #[derive(Clone, Copy, Debug)]
 pub struct Ramp {
-    /// Counts in one pass at or above which the hand is moving on purpose.
+    /// Hand speed, in counts a second, that pushes the grip off at full rate.
     ///
-    /// A hand at rest does not report a small number — it reports nothing at
-    /// all. Eight seconds with the hand off the mouse delivered no packets,
-    /// measured, so this only has to sit under the smallest movement anyone
-    /// makes on purpose rather than above some noise floor.
-    pub moving: i64,
+    /// A speed, not a number of counts in a pass. Counts in a pass measure
+    /// the same hand differently on a machine that runs the loop at a
+    /// different rate — half as often is twice as many counts each time — so
+    /// a threshold written that way is a different product on every machine.
+    ///
+    /// Nothing below it is ignored. A hand moving at a tenth of this pushes
+    /// at a tenth of the rate and still gets the view, in ten times as long.
+    /// A threshold would have had a speed under which the player could not
+    /// take the view back at all, however long they pushed for, which is a
+    /// worse thing than a slow handover.
+    pub full_push: f32,
     /// From nothing to full strength, with the hand still.
     ///
     /// Also what a hold begins with, since the strength is at nothing between
     /// holds. So every press eases in rather than seizing the view, and a
     /// hand still moving when the button goes down only delays the rise.
     pub rise: Duration,
-    /// From full strength to nothing, with the hand pushing.
+    /// From full strength to nothing, with the hand pushing at full rate.
     ///
     /// Pushing against the assist meets a grip that eases off over this,
     /// rather than one that lets go between two passes. The player still ends
@@ -179,13 +185,18 @@ pub struct Ramp {
 }
 
 impl Ramp {
-    /// Whether the hand moved on purpose this pass.
+    /// How hard the hand is pushing, from nothing to full.
     ///
     /// Per axis, not combined: a movement that is purely vertical is as
     /// deliberate as one that is not, and adding the two would let a diagonal
     /// of two small movements count as one large one.
-    pub fn moved(self, counts: [i64; 2]) -> bool {
-        counts[0].abs().max(counts[1].abs()) >= self.moving
+    pub fn push(self, counts: [i64; 2], elapsed: Duration) -> f32 {
+        let moved = counts[0].abs().max(counts[1].abs());
+        let seconds = elapsed.as_secs_f32();
+        if moved == 0 || seconds <= 0.0 || self.full_push <= 0.0 {
+            return 0.0;
+        }
+        (moved as f32 / seconds / self.full_push).clamp(0.0, 1.0)
     }
 }
 
@@ -212,22 +223,44 @@ pub struct Grip {
     along: f32,
 }
 
+/// The most of a ramp one pass may cover.
+///
+/// A pass longer than the ramp itself would otherwise carry the grip from
+/// nothing to full in one step, which is the hard edge the ramp exists to
+/// remove — and long passes are reachable: the overlay is rebuilt behind a
+/// half-second gate whenever the game window comes back, and the scheduler
+/// takes the thread away without asking. A stall should cost the ramp some
+/// time, not turn it back into a switch.
+const MOST_OF_A_RAMP: f32 = 0.25;
+
 impl Grip {
-    /// Move the grip one pass towards where it should be, and say how firm it
-    /// is now.
+    /// Move the grip one pass, and say how firm it is now.
+    ///
+    /// `engaged` is whether the button is down at all; `push` is how hard the
+    /// hand is working against it. With the button up the grip falls at full
+    /// rate, so the next press has to earn its strength back from nothing.
     ///
     /// `elapsed` is passed in rather than measured, so the ramp can be tested
-    /// without waiting for a clock, and so the rise takes the same time at
-    /// any rate the loop happens to run at.
-    pub fn update(&mut self, wanted: bool, elapsed: Duration, ramp: Ramp) -> f32 {
-        let over = if wanted { ramp.rise } else { ramp.fall }.as_secs_f32();
-        let step = if over > 0.0 {
-            elapsed.as_secs_f32() / over
+    /// without waiting for a clock, and so it takes the same time at any rate
+    /// the loop happens to run at.
+    pub fn update(&mut self, engaged: bool, push: f32, elapsed: Duration, ramp: Ramp) -> f32 {
+        let push = if engaged { push.clamp(0.0, 1.0) } else { 1.0 };
+        self.along += if push > 0.0 {
+            -Self::step(elapsed, ramp.fall) * push
         } else {
-            1.0
+            Self::step(elapsed, ramp.rise)
         };
-        self.along = (self.along + if wanted { step } else { -step }).clamp(0.0, 1.0);
+        self.along = self.along.clamp(0.0, 1.0);
         smooth(self.along)
+    }
+
+    /// The share of a ramp one pass of this length covers.
+    fn step(elapsed: Duration, over: Duration) -> f32 {
+        let over = over.as_secs_f32();
+        if over <= 0.0 {
+            return MOST_OF_A_RAMP;
+        }
+        (elapsed.as_secs_f32() / over).min(MOST_OF_A_RAMP)
     }
 
     /// How firm it is, without moving it. For anything that only reports.
@@ -254,10 +287,13 @@ pub enum Refusal {
     NotHeld,
     NotInFront,
     NoLocalPlayer,
+    NotAlive,
     ViewImplausible,
     NoPositionForUs,
+    HandUnreadable,
     NoEnemyInTheCone,
     HandWins,
+    Easing,
     AlreadyOnTarget,
     WindowsRefused,
     Steering,
@@ -269,21 +305,53 @@ impl Refusal {
     /// Listed rather than derived, and held to the real list by a test: a
     /// reason missing from here would be a reason nothing ever reports, which
     /// is the exact shape of the failure the tally exists to catch.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; Self::COUNT] = [
         Self::NotHeld,
         Self::NotInFront,
         Self::NoLocalPlayer,
+        Self::NotAlive,
         Self::ViewImplausible,
         Self::NoPositionForUs,
+        Self::HandUnreadable,
         Self::NoEnemyInTheCone,
         Self::HandWins,
+        Self::Easing,
         Self::AlreadyOnTarget,
         Self::WindowsRefused,
         Self::Steering,
     ];
 
     /// How many there are, for sizing a tally that cannot be indexed past.
-    pub const COUNT: usize = Self::ALL.len();
+    ///
+    /// Written out rather than taken from the roll call, so that the two have
+    /// to be made to agree instead of one silently following the other.
+    pub const COUNT: usize = 13;
+
+    /// Which slot of the tally this one is counted in.
+    ///
+    /// A match rather than the variant's own number, because a match must
+    /// cover every variant: a reason added to the enum cannot compile until
+    /// it has been given a slot, and the roll call test then refuses to pass
+    /// until that slot is inside the tally and belongs to nothing else. The
+    /// variant's own number would have needed neither, and a reason with no
+    /// slot is a reason counted where nobody looks.
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::NotHeld => 0,
+            Self::NotInFront => 1,
+            Self::NoLocalPlayer => 2,
+            Self::NotAlive => 3,
+            Self::ViewImplausible => 4,
+            Self::NoPositionForUs => 5,
+            Self::HandUnreadable => 6,
+            Self::NoEnemyInTheCone => 7,
+            Self::HandWins => 8,
+            Self::Easing => 9,
+            Self::AlreadyOnTarget => 10,
+            Self::WindowsRefused => 11,
+            Self::Steering => 12,
+        }
+    }
 
     /// A short name, for a line that has to carry every one of them at once.
     pub const fn key(self) -> &'static str {
@@ -292,6 +360,9 @@ impl Refusal {
             Self::NotInFront => "not-in-front",
             Self::NoLocalPlayer => "no-local-player",
             Self::ViewImplausible => "view-implausible",
+            Self::NotAlive => "not-alive",
+            Self::HandUnreadable => "hand-unreadable",
+            Self::Easing => "easing",
             Self::NoPositionForUs => "no-position",
             Self::NoEnemyInTheCone => "no-enemy",
             Self::HandWins => "hand",
@@ -313,6 +384,9 @@ impl Refusal {
             Self::NotInFront => "held, but the game is not in front",
             Self::NoLocalPlayer => "no plausible reading of us",
             Self::ViewImplausible => "view angles implausible — stale offsets?",
+            Self::NotAlive => "we are not alive",
+            Self::HandUnreadable => "the mouse cannot be read — refusing to steer blind",
+            Self::Easing => "easing in",
             Self::NoPositionForUs => "our own position is not readable",
             Self::NoEnemyInTheCone => "no living enemy in the cone",
             Self::HandWins => "your hand",
@@ -550,29 +624,75 @@ mod tests {
 
     fn ramp() -> Ramp {
         Ramp {
-            moving: 2,
+            // Six counts in an eight millisecond pass.
+            full_push: 750.0,
             rise: Duration::from_millis(120),
             fall: Duration::from_millis(120),
         }
     }
 
+    /// Counts in one pass that push at full rate.
+    fn a_full_push() -> [i64; 2] {
+        [(ramp().full_push * PASS.as_secs_f32()).ceil() as i64, 0]
+    }
+
     /// Run the ramp one way for this long, and give the strength it reaches.
-    fn ramped(grip: &mut Grip, wanted: bool, over: Duration) -> f32 {
+    fn ramped(grip: &mut Grip, engaged: bool, push: f32, over: Duration) -> f32 {
         let mut passed = Duration::ZERO;
         let mut firmness = grip.firmness();
         while passed < over {
-            firmness = grip.update(wanted, PASS, ramp());
+            firmness = grip.update(engaged, push, PASS, ramp());
             passed += PASS;
         }
         firmness
     }
 
     #[test]
-    fn a_hand_at_rest_is_moving_on_purpose_and_one_that_barely_twitches_is_not() {
-        assert!(!ramp().moved([0, 0]));
-        assert!(!ramp().moved([1, -1]), "under the threshold either way");
-        assert!(ramp().moved([2, 0]), "sideways");
-        assert!(ramp().moved([0, -2]), "and vertically");
+    fn a_hand_at_rest_pushes_not_at_all_and_a_fast_one_pushes_as_hard_as_it_can() {
+        assert_eq!(ramp().push([0, 0], PASS), 0.0);
+        assert_eq!(ramp().push(a_full_push(), PASS), 1.0, "sideways");
+        let [counts, _] = a_full_push();
+        assert_eq!(ramp().push([0, -counts], PASS), 1.0, "and vertically");
+        // Nothing in between is ignored: a slower hand pushes more gently
+        // rather than not at all, which is what keeps a speed under which the
+        // view could never be taken back from existing at all.
+        let gentle = ramp().push([counts / 4, 0], PASS);
+        assert!(gentle > 0.0 && gentle < 0.5, "{gentle}");
+    }
+
+    #[test]
+    fn the_same_hand_pushes_the_same_however_often_the_loop_asks() {
+        // Counts in a pass measure the same hand differently at a different
+        // rate. A speed does not, and the feel of the assist must not depend
+        // on the machine it is running on.
+        let fast = ramp().push([6, 0], Duration::from_millis(8));
+        let slow = ramp().push([12, 0], Duration::from_millis(16));
+        assert!((fast - slow).abs() < 1e-6, "{fast} against {slow}");
+    }
+
+    #[test]
+    fn a_hand_pushing_gently_still_ends_with_the_view_rather_than_never_winning() {
+        let mut grip = Grip::default();
+        assert!(ramped(&mut grip, true, 0.0, ramp().rise) > 0.99);
+        // A tenth of a full push, for ten falls. A threshold would have left
+        // this hand pinned under the assist for as long as it cared to push.
+        assert_eq!(ramped(&mut grip, true, 0.1, ramp().fall * 11), 0.0);
+    }
+
+    #[test]
+    fn one_long_pass_may_not_carry_the_grip_all_the_way_in_a_single_step() {
+        // Reachable: the overlay is rebuilt behind a half second gate when
+        // the game window comes back, and the scheduler takes the thread away
+        // without asking. A stall must cost the ramp time, not turn it back
+        // into the switch it replaced.
+        let mut grip = Grip::default();
+        let firmness = grip.update(true, 0.0, ramp().rise * 4, ramp());
+        assert!(firmness < 0.5, "seized the view in one pass: {firmness}");
+
+        let mut full = Grip::default();
+        ramped(&mut full, true, 0.0, ramp().rise);
+        let after = full.update(false, 0.0, ramp().fall * 4, ramp());
+        assert!(after > 0.2, "dropped the view in one pass: {after}");
     }
 
     #[test]
@@ -582,10 +702,10 @@ mod tests {
         let mut grip = Grip::default();
         assert_eq!(grip.firmness(), 0.0);
 
-        let part_way = ramped(&mut grip, true, ramp().rise / 2);
+        let part_way = ramped(&mut grip, true, 0.0, ramp().rise / 2);
         assert!(part_way > 0.0 && part_way < 1.0, "{part_way}");
 
-        let full = ramped(&mut grip, true, ramp().rise);
+        let full = ramped(&mut grip, true, 0.0, ramp().rise);
         assert!(full > 0.99, "{full}");
     }
 
@@ -595,7 +715,7 @@ mod tests {
         // the assist goes from doing nothing to climbing at full rate.
         let mut grip = Grip::default();
         let tenth = ramp().rise / 10;
-        let early = ramped(&mut grip, true, tenth);
+        let early = ramped(&mut grip, true, 0.0, tenth);
         assert!(
             early < 0.1,
             "an even rise would be at a tenth by now: {early}"
@@ -603,29 +723,37 @@ mod tests {
 
         // And the same at the top, arriving rather than striking.
         let mut grip = Grip::default();
-        let nine_tenths = ramped(&mut grip, true, tenth * 9);
+        let nine_tenths = ramped(&mut grip, true, 0.0, tenth * 9);
         assert!(nine_tenths > 0.9, "{nine_tenths}");
     }
 
     #[test]
     fn pushing_against_it_eases_the_grip_off_rather_than_taking_it_away() {
         let mut grip = Grip::default();
-        assert!(ramped(&mut grip, true, ramp().rise) > 0.99);
+        assert!(ramped(&mut grip, true, 0.0, ramp().rise) > 0.99);
 
         // Partway through the fall the assist is still there, and weaker.
-        let easing = ramped(&mut grip, false, ramp().fall / 2);
+        let easing = ramped(&mut grip, true, 1.0, ramp().fall / 2);
         assert!(easing > 0.0 && easing < 0.9, "{easing}");
 
-        // Keep pushing and the view is entirely the player's.
-        assert_eq!(ramped(&mut grip, false, ramp().fall), 0.0);
+        // Keep pushing and the view belongs entirely to the player.
+        assert_eq!(ramped(&mut grip, true, 1.0, ramp().fall), 0.0);
     }
 
     #[test]
     fn the_grip_never_leaves_the_range_it_is_measured_in() {
         let mut grip = Grip::default();
-        for wanted in [true, true, false, true, false, false, true] {
+        for (engaged, push) in [
+            (true, 0.0),
+            (true, 1.0),
+            (false, 0.0),
+            (false, 1.0),
+            (true, 0.5),
+            (true, -3.0),
+            (true, f32::NAN),
+        ] {
             for _ in 0..500 {
-                let firmness = grip.update(wanted, PASS, ramp());
+                let firmness = grip.update(engaged, push, PASS, ramp());
                 assert!((0.0..=1.0).contains(&firmness), "{firmness}");
             }
         }
@@ -639,9 +767,9 @@ mod tests {
         let mut slow = Grip::default();
         let mut passed = Duration::ZERO;
         while passed < ramp().rise {
-            fast.update(true, Duration::from_millis(2), ramp());
-            fast.update(true, Duration::from_millis(2), ramp());
-            slow.update(true, Duration::from_millis(4), ramp());
+            fast.update(true, 0.0, Duration::from_millis(2), ramp());
+            fast.update(true, 0.0, Duration::from_millis(2), ramp());
+            slow.update(true, 0.0, Duration::from_millis(4), ramp());
             passed += Duration::from_millis(4);
         }
         assert!((fast.firmness() - slow.firmness()).abs() < 1e-3);
@@ -654,12 +782,12 @@ mod tests {
         // that a hold began, which is what makes that impossible rather than
         // merely avoided.
         let mut grip = Grip::default();
-        assert!(ramp().moved([30, 5]), "mid-flick, button down");
-        assert_eq!(ramped(&mut grip, false, ramp().fall), 0.0);
+        assert_eq!(ramp().push([300, 50], PASS), 1.0, "mid-flick, button down");
+        assert_eq!(ramped(&mut grip, true, 1.0, ramp().fall), 0.0);
 
         // The hand settles, and the assist is all the way there one rise
         // later — late, not absent.
-        assert!(ramped(&mut grip, true, ramp().rise) > 0.99);
+        assert!(ramped(&mut grip, true, 0.0, ramp().rise) > 0.99);
     }
 
     #[test]
@@ -670,7 +798,7 @@ mod tests {
         // the thing meant to break it.
         let mut seen = [false; Refusal::COUNT];
         for refusal in Refusal::ALL {
-            let index = refusal as usize;
+            let index = refusal.slot();
             assert!(index < Refusal::COUNT, "{refusal:?} indexes past the tally");
             assert!(!seen[index], "{refusal:?} listed twice");
             seen[index] = true;
