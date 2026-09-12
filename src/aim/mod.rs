@@ -121,6 +121,18 @@ pub struct Steering {
     /// from accelerating to coasting. A curve that bends towards the ceiling
     /// has no such place in it.
     pub cap: f32,
+    /// The strength below which the assist sends nothing at all.
+    ///
+    /// Nothing, not less. There was no floor, and a grip of two per cent
+    /// against an offset of twenty degrees still sent seven counts — the
+    /// assist never went quiet while the player pushed against it, it only
+    /// got quieter. A force the player can feel and cannot benefit from is
+    /// the worst of both, and it is what "I can't pull down" is.
+    ///
+    /// It also settles what a pass means. Above the floor the assist is live
+    /// and the pull is spending itself; below it the assist is not there, and
+    /// nothing it is not doing should be charged to it or reported about it.
+    pub least_grip: f32,
     /// Below this many degrees the view is treated as already there.
     ///
     /// A target is not a point: it is a person, several degrees wide at the
@@ -178,7 +190,7 @@ pub struct Steering {
     /// ponytail: a guess at a fraction of a torso. Replace it with the real
     /// hitbox geometry, which the old product already has.
     pub settle_within: f32,
-    /// How much steering one press's pull may do before it gives up.
+    /// How much of a press the pull may be live for before it gives up.
     ///
     /// The pull is meant to end once, and arriving was the only thing that
     /// ended it — so a press whose target stepped behind cover, or whose
@@ -187,18 +199,24 @@ pub struct Steering {
     /// this was built not to have: an assist fighting the recoil the player
     /// is compensating by hand, for thirty bullets.
     ///
-    /// **Time spent steering, not time since the button went down.** A press
-    /// where the player pushed back for half of it has not had half a pull;
-    /// it has had half as much of one, and cancelling it for taking too long
-    /// punishes the assist for doing the thing it is supposed to do. A log
-    /// caught exactly that — given up at a degree and a half off, with the
-    /// grip at eighteen per cent and the hand having pushed through half the
-    /// passes, and the grip back at full a fraction of a second later with
-    /// nothing left to spend it on.
+    /// **Time the assist was live for, not time since the button went down.**
+    /// A press the player pushed back through half of has not had half a
+    /// pull; cancelling it for taking too long punishes the assist for doing
+    /// the thing it is most supposed to do. A log caught exactly that — given
+    /// up a degree and a half off with the grip at eighteen per cent, and the
+    /// grip back at full a fraction of a second later with nothing left to
+    /// spend it on.
     ///
-    /// Generous against what a pull costs — twenty-eight degrees took about
-    /// a hundred and twenty milliseconds of steering — so reaching it means
-    /// the pull is not converging rather than that it needed longer.
+    /// Live means the grip is over its floor, which is also when anything is
+    /// being sent. The passes below it cost nothing because during them the
+    /// assist is not there — and it cannot run away with a press either,
+    /// since a press it is never live during is a press it never touches.
+    ///
+    /// Measured against what a pull costs in the same unit: twenty-eight
+    /// degrees of closing took about a hundred and twenty milliseconds of
+    /// wall clock with the hand quiet, which is a hundred and twenty of being
+    /// live. Reaching three hundred means the pull is not converging rather
+    /// than that it needed longer.
     pub pull_limit: Duration,
     /// Targets further than this from where the player is already pointing are
     /// not targets.
@@ -217,6 +235,10 @@ impl Steering {
     /// pass may move at full strength and not some fraction of it.
     pub fn counts(self, offset: Offset, grip: f32) -> Option<[i32; 2]> {
         if !offset.size().is_finite() || !grip.is_finite() || offset.size() < self.deadzone {
+            return None;
+        }
+        // Off, rather than faint. See `least_grip`.
+        if grip < self.least_grip {
             return None;
         }
         let scale = self.counts_per_degree * self.gain;
@@ -267,6 +289,7 @@ pub const STEERING: Steering = Steering {
     // accelerating and starts coasting.
     cap: 250.0,
     deadzone: 0.15,
+    least_grip: 0.25,
     settle_within: 6.0,
     pull_limit: Duration::from_millis(300),
     eye_height: 64.0,
@@ -302,7 +325,12 @@ pub const RAMP: Ramp = Ramp {
     // meet the clamp that stops one pass crossing a whole ramp, and quietly
     // become the switch this replaced.
     rise: Duration::from_millis(40),
-    fall: Duration::from_millis(120),
+    // Shortened along with the floor beneath the grip: at a hundred and
+    // twenty it took about ninety milliseconds of pushing to fall under the
+    // floor, which is ninety milliseconds of the assist arguing. At seventy
+    // it is under fifty, and the handover can still be felt happening rather
+    // than arriving already done.
+    fall: Duration::from_millis(70),
 };
 
 /// How the strength the assist steers with rises and falls.
@@ -478,7 +506,7 @@ pub struct Situation<'a> {
     pub me: Option<LocalPlayer>,
     pub players: &'a [Player],
     pub angles: ViewAngles,
-    /// How much of this press has been spent steering.
+    /// How much of this press the assist has been live for.
     ///
     /// Not how long the button has been down: the passes the player had the
     /// view are not the pull's to be charged for. Passed in rather than kept,
@@ -718,6 +746,17 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// Whether this is the assist being live, for the purpose of deciding
+    /// that something happened worth writing down.
+    ///
+    /// Steering and easing in differ by whether the grip is over its floor,
+    /// which a hand crosses several times a second — and every crossing wrote
+    /// a line, and every line is a write into a file from the middle of the
+    /// frame. The tally still counts them apart; the log does not need to.
+    pub const fn live(self) -> bool {
+        matches!(self, Self::Steering | Self::Easing | Self::HandWins)
+    }
+
     /// Every refusal there is, which is what makes a tally of them complete.
     ///
     /// Listed rather than derived, and held to the real list by a test: a
@@ -829,6 +868,7 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
+            least_grip: 0.25,
             settle_within: 6.0,
             pull_limit: Duration::from_millis(300),
             eye_height: 64.0,
@@ -1585,25 +1625,76 @@ mod tests {
             "still within what it may spend"
         );
 
-        // And what it may spend is steering, not the clock. A press where the
-        // player pushed back through half of it has had half as much of a
-        // pull, not half a pull, and a log had one cancelled at a degree and
-        // a half off with the grip at eighteen per cent — punished for the
-        // yielding that is the point of the whole thing. Nothing here can
-        // enforce that on its own; what it can do is refuse to make the
-        // distinction impossible, which is why this is a duration in and not
-        // a press start.
-        now.pulling_for = Duration::ZERO;
-        assert!(
-            STEERING.choose(&now, ramp(), 0.0, 1.0).counts.is_err(),
-            "a pass the player has taken sends nothing"
-        );
-
         now.pulling_for = STEERING.pull_limit + Duration::from_millis(1);
         assert_eq!(
             STEERING.choose(&now, ramp(), 1.0, 0.0).counts,
             Err(Refusal::PullGaveUp)
         );
+    }
+
+    #[test]
+    fn a_grip_under_its_floor_sends_nothing_rather_than_something_faint() {
+        // What "I can't pull down" was. With no floor, two per cent of grip
+        // against twenty degrees still sent seven counts: the assist never
+        // went quiet while it was being pushed, it only got quieter, and a
+        // force that can be felt and cannot be benefited from is the worst of
+        // both.
+        let far_off = Offset {
+            yaw: -20.0,
+            pitch: 0.0,
+        };
+        assert_eq!(steering().counts(far_off, 0.02), None);
+        assert_eq!(
+            steering().counts(far_off, steering().least_grip - 0.01),
+            None
+        );
+        assert!(steering().counts(far_off, steering().least_grip).is_some());
+    }
+
+    #[test]
+    fn half_strength_is_still_strength() {
+        // The floor cuts a force too faint to be worth feeling, and nothing
+        // else. Raised far enough it would be a switch again with extra
+        // steps, and the ramp above it would be decoration.
+        let far_off = Offset {
+            yaw: -20.0,
+            pitch: 0.0,
+        };
+        assert!(steering().counts(far_off, 0.5).is_some());
+        assert!(STEERING.counts(far_off, 0.5).is_some());
+    }
+
+    #[test]
+    fn the_log_is_told_about_being_live_and_the_tally_about_which_kind() {
+        // Steering, easing in and yielding differ by whether the grip is over
+        // its floor, which a hand crosses several times a second. Keyed
+        // apart, every crossing wrote a line, and a line is a write into a
+        // file from the middle of the frame at a hundred and twenty-five
+        // frames a second.
+        for live in [Refusal::Steering, Refusal::Easing, Refusal::HandWins] {
+            assert!(live.live(), "{live:?}");
+        }
+        for done in [
+            Refusal::NotHeld,
+            Refusal::Delivered,
+            Refusal::PullSpent,
+            Refusal::PullGaveUp,
+            Refusal::NoEnemyInTheCone,
+        ] {
+            assert!(!done.live(), "{done:?}");
+        }
+    }
+
+    #[test]
+    fn at_the_floor_a_movement_is_still_worth_at_least_one_count() {
+        // Otherwise there is a band above the floor where the assist is live,
+        // is charged for being live, and sends nothing — which would put the
+        // flicker back in the log one layer up from where it was taken out.
+        let barely = Offset {
+            yaw: -STEERING.deadzone,
+            pitch: 0.0,
+        };
+        assert!(STEERING.counts(barely, STEERING.least_grip).is_some());
     }
 
     #[test]

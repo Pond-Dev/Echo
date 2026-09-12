@@ -54,6 +54,14 @@ const FRAME: Duration = Duration::from_millis(8);
 const ATTACH_RETRY: Duration = Duration::from_millis(500);
 /// How often the achieved rate is written to the log.
 const PACE_REPORT: Duration = Duration::from_secs(2);
+/// The most one pass may charge to a pull's budget.
+///
+/// The period a pass reads is the last completed one, so a stall would charge
+/// its whole length to whichever pass steered next and end a pull that was
+/// going perfectly well. Twice the target period, so an ordinary pass pays
+/// exactly what it took.
+const MOST_OF_A_PASS: Duration = Duration::from_millis(16);
+
 /// How long after a pull a hit is still credited to it.
 ///
 /// Without a limit the first delivery of a session is blamed for every hit
@@ -629,7 +637,18 @@ impl Aim {
     /// seconds of play. Handing over once a press removed the crossing rather
     /// than papering over it, so there is nothing left to collapse.
     const fn state(&self) -> (bool, bool, Option<usize>, Refusal) {
-        (self.active, self.blocked, self.target, self.reason)
+        // Being live, easing in and yielding collapse together. They differ
+        // by whether the grip is over its floor, which a hand crosses several
+        // times a second, and every crossing wrote a line — and a line is a
+        // write into a file from the middle of the frame, at a hundred and
+        // twenty-five of them a second. The tally counts them apart; the log
+        // only has to say when something happened.
+        let reason = if self.reason.live() {
+            Refusal::Steering
+        } else {
+            self.reason
+        };
+        (self.active, self.blocked, self.target, reason)
     }
 
     fn steer(
@@ -711,15 +730,25 @@ impl Aim {
             self.offset = choice.offset;
             self.distance = choice.distance;
         }
+        // Charged for the passes the assist was live on, which is the same
+        // thing as the passes anything could have been sent on, and charged
+        // after the fact so this pass was decided on what came before it.
+        //
+        // Not on whether a movement went out: a pass Windows refused moved
+        // nothing, and a pass where the pull was live and the rounding
+        // happened to land on zero was still a pass the assist spent.
+        //
+        // Capped at a pass's worth of the budget, because the period read
+        // here is the last completed one and a stall — a rebuilt overlay, a
+        // descheduled thread — would otherwise charge half a second to
+        // whichever pass came next and end a pull that was converging.
+        if active && grip >= STEERING.least_grip {
+            self.pulled_for += elapsed.min(MOST_OF_A_PASS);
+        }
+        self.just_delivered = choice.arrived && self.delivered_to.is_none();
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
         // which is the tracking this deliberately does not do.
-        // Charged only for the passes it steered on, and charged after the
-        // fact, so this pass is decided on what the pull had spent before it.
-        if choice.counts.is_ok() {
-            self.pulled_for += elapsed;
-        }
-        self.just_delivered = choice.arrived && self.delivered_to.is_none();
         if choice.arrived {
             self.delivered_to = self.delivered_to.or(choice.target);
         }
@@ -782,7 +811,11 @@ impl Aim {
         if let Some(share) = (self.pushed * 100).checked_div(self.passes) {
             line += &format!("   hand {share}% of {} passes", self.passes);
         }
-        if self.pulled_for > Duration::ZERO {
+        if self.active || self.passes > 0 {
+            // Printed at nothing too. A press the assist was never live
+            // during is the one worth finding, and a line that only appears
+            // when something happened cannot be told from a line that is not
+            // there.
             line += &format!(
                 "   pulled {:.0} of {:.0} ms",
                 self.pulled_for.as_secs_f64() * 1000.0,
