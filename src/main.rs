@@ -38,7 +38,7 @@
 use std::time::{Duration, Instant};
 
 use echo::aim::{Grip, Offset, RAMP, Refusal, STEERING, Situation};
-use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
+use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix, damage_between};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
 use echo::overlay::{FrameCost, Overlay, rgb};
@@ -129,6 +129,11 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
 
     let mut aim = Aim::default();
     let mut next_aim = Instant::now();
+    // The previous pass's roster, kept whole rather than as the key the log
+    // is deduplicated on, because who lost health is the one thing worth
+    // knowing that the key deliberately throws away.
+    let mut before: Vec<Player> = Vec::new();
+    let mut landed: Option<Instant> = None;
     let mut last_logged = None;
     let mut next_pace = Instant::now();
     let mut pace = Pace::default();
@@ -196,7 +201,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // Focus is a guard, not a preference. With the game behind something
         // else, the same counts drag the pointer across whatever is in front.
         let allowed = overlay.as_ref().is_some_and(Overlay::target_has_focus);
-        let before = aim.state();
+        let was = aim.state();
         Stages::time(&mut stages.steer, || {
             // One pass stale, since the period is closed at the end of a
             // pass and this is the middle of the next. A few hundred
@@ -206,10 +211,41 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // Every change of state, and then every half second while it lasts.
         // A single line at the end of a hold cannot say whether the view
         // walked onto the target or walked away from it.
-        if aim.state() != before || (aim.active && started >= next_aim) {
+        if aim.state() != was || (aim.active && started >= next_aim) {
             log.record(&aim.describe());
             next_aim = started + AIM_REPORT;
         }
+        if aim.just_delivered {
+            landed = Some(started);
+        }
+
+        // What the whole thing is for, and the only line in the file that
+        // says so. Everything else here is a stand-in — degrees off, how firm
+        // the grip was, how many passes it took — and stand-ins were
+        // reporting a session as going well while every shot in it landed on
+        // an arm.
+        for hit in damage_between(&before, &players) {
+            let after = landed.map_or_else(
+                || "   no pull behind it".to_owned(),
+                |at| {
+                    format!(
+                        "   {:.0} ms after the pull landed",
+                        at.elapsed().as_secs_f64() * 1000.0
+                    )
+                },
+            );
+            log.record(&format!(
+                "hit 0x{:X} {} -{} ({} -> {}){}{after}",
+                hit.pawn,
+                hit.team.label(),
+                hit.amount(),
+                hit.from,
+                hit.to,
+                if hit.fatal() { "   down" } else { "" },
+            ));
+        }
+        before.clear();
+        before.extend_from_slice(&players);
 
         if let Some(overlay) = overlay.as_mut() {
             Stages::time(&mut stages.pump, || overlay.pump());
@@ -493,6 +529,11 @@ struct Aim {
     /// be read as a length on a chest rather than as an angle, which cannot
     /// be read at all without it.
     distance: f32,
+    /// Whether the pull finished on this very pass.
+    ///
+    /// The moment, not the state: the state stays true for the rest of the
+    /// press, and what a hit is measured from is when the pull ended.
+    just_delivered: bool,
     /// Who this press's pull was spent on, if anyone.
     ///
     /// Belongs to the press, so it lives here rather than in the deciding —
@@ -608,6 +649,7 @@ impl Aim {
         // Latched, never unlatched until the next press. Asking again each
         // pass would hand the view back the instant the target moved off it,
         // which is the tracking this deliberately does not do.
+        self.just_delivered = choice.arrived && self.delivered_to.is_none();
         if choice.arrived {
             self.delivered_to = self.delivered_to.or(choice.target);
         }

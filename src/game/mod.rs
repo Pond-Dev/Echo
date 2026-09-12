@@ -273,6 +273,54 @@ impl Player {
     }
 }
 
+/// Health somebody lost between two readings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Damage {
+    pub pawn: usize,
+    pub team: Team,
+    pub from: i32,
+    pub to: i32,
+}
+
+impl Damage {
+    pub const fn amount(self) -> i32 {
+        self.from - self.to
+    }
+
+    pub const fn fatal(self) -> bool {
+        self.to == 0
+    }
+}
+
+/// Who lost health between two readings of the same players.
+///
+/// The only measurement in the program that is about what the product is for
+/// rather than about how it runs. Everything else — degrees off, how firm the
+/// grip was, how many passes it took — is a stand-in for this, and stand-ins
+/// were agreeing that things were going well through a session in which the
+/// shots were landing on an arm.
+///
+/// Only falls count. A reading that climbs is somebody healing or, far more
+/// often, a pawn that has been reused for a player who respawned; either way
+/// nobody was shot. And both readings have to be plausible, so a health read
+/// out of a pointer that has gone stale cannot invent a hit out of rubbish.
+pub fn damage_between(before: &[Player], now: &[Player]) -> Vec<Damage> {
+    now.iter()
+        .filter(|player| player.plausible())
+        .filter_map(|player| {
+            let was = before
+                .iter()
+                .find(|earlier| earlier.pawn == player.pawn && earlier.plausible())?;
+            (player.health < was.health).then_some(Damage {
+                pawn: player.pawn,
+                team: player.team,
+                from: was.health,
+                to: player.health,
+            })
+        })
+        .collect()
+}
+
 /// Pitch and yaw in degrees, as the engine stores them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewAngles {
@@ -341,7 +389,62 @@ impl LocalPlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalPlayer, Team, ViewAngles};
+    use super::{Damage, LocalPlayer, Player, Team, ViewAngles, damage_between};
+
+    fn standing(pawn: usize, health: i32) -> Player {
+        Player {
+            controller: pawn,
+            pawn,
+            team: Team::Terrorist,
+            health,
+            origin: Some([0.0; 3]),
+        }
+    }
+
+    #[test]
+    fn losing_health_is_reported_and_gaining_it_is_not() {
+        let before = [standing(1, 100), standing(2, 40)];
+        let now = [standing(1, 73), standing(2, 100)];
+        assert_eq!(
+            damage_between(&before, &now),
+            vec![Damage {
+                pawn: 1,
+                team: Team::Terrorist,
+                from: 100,
+                to: 73
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pawn_nobody_had_seen_before_is_not_somebody_who_lost_health() {
+        // Which matters here more than it sounds: a pawn is reused when a
+        // player respawns, so somebody arriving in the table at less than
+        // full health is ordinary rather than a hit.
+        assert_eq!(damage_between(&[], &[standing(1, 40)]), vec![]);
+        assert_eq!(damage_between(&[standing(1, 40)], &[]), vec![]);
+    }
+
+    #[test]
+    fn a_reading_that_could_not_be_real_does_not_become_a_hit() {
+        // A pointer gone stale reads rubbish, and rubbish that happens to be
+        // smaller than the last real number would otherwise look like damage.
+        let before = [standing(1, 100)];
+        assert_eq!(damage_between(&before, &[standing(1, -5000)]), vec![]);
+        assert_eq!(
+            damage_between(&[standing(1, 9000)], &[standing(1, 50)]),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn reaching_zero_is_the_last_of_it() {
+        let dead = damage_between(&[standing(1, 18)], &[standing(1, 0)]);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].amount(), 18);
+        assert!(dead[0].fatal());
+        assert!(!damage_between(&[standing(1, 100)], &[standing(1, 73)])[0].fatal());
+    }
 
     fn facing(yaw: f32) -> ViewAngles {
         ViewAngles { pitch: 0.0, yaw }
