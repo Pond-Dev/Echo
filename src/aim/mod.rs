@@ -218,7 +218,7 @@ pub const STEERING: Steering = Steering {
 /// measure the same hand differently on a machine that runs the loop at a
 /// different rate. Nothing under it is ignored either: everything between
 /// nothing and this works against the rise in proportion, and the push that
-/// exactly cancels it is [`Ramp::holding_push`] — about seven degrees a
+/// exactly cancels it is [`Ramp::holding_push`] — about eleven degrees a
 /// second here, which is a push rather than a correction.
 ///
 /// The durations replace what was once a plain switch. A session's tally read
@@ -228,7 +228,18 @@ pub const STEERING: Steering = Steering {
 /// Nothing about that is visible as a decision — it is felt as a hard edge.
 pub const RAMP: Ramp = Ramp {
     full_push: 750.0,
-    rise: Duration::from_millis(140),
+    // Short because the trigger is the button, and a shot is short. Measured:
+    // presses ran fifty to a hundred milliseconds, and a rise of a hundred
+    // and forty left the grip at a fifth to two fifths of full when the
+    // button came back up — the pull covered about a degree of a five degree
+    // gap and gave up. Thirty-four seconds of play held the view for less
+    // than one of them.
+    //
+    // A pass covers a fifth of this, so the ease-in is five passes and the
+    // curve is still a curve — but only just. Shortening it further would
+    // meet the clamp that stops one pass crossing a whole ramp, and quietly
+    // become the switch this replaced.
+    rise: Duration::from_millis(40),
     fall: Duration::from_millis(120),
 };
 
@@ -1351,8 +1362,8 @@ mod tests {
 
         let holding = RAMP.holding_push() * degrees_a_second;
         assert!(
-            (5.0..9.0).contains(&holding),
-            "the grip holds at {holding:.1} degrees a second, not the seven \
+            (9.0..13.0).contains(&holding),
+            "the grip holds at {holding:.1} degrees a second, not the eleven \
              it is written as"
         );
 
