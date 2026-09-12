@@ -501,6 +501,12 @@ enum Refusal {
 }
 
 impl Refusal {
+    /// Whether the view is being held on a target. Moving onto one and
+    /// sitting on one are the same thing from outside.
+    const fn engaged(self) -> bool {
+        matches!(self, Self::Steering | Self::AlreadyOnTarget)
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::NotHeld => "idle",
@@ -518,8 +524,19 @@ impl Refusal {
 
 impl Aim {
     /// What the log is keyed on: a line is written when any of this changes.
+    ///
+    /// Steering towards a target and sitting on one collapse together here.
+    /// They differ by whether the offset is over the deadzone this instant,
+    /// and a target on foot crosses it several times a second — which wrote
+    /// three hundred and forty-seven lines for fifteen seconds of play and
+    /// buried everything worth reading in them.
     const fn state(&self) -> (bool, bool, Option<usize>, Refusal) {
-        (self.active, self.blocked, self.target, self.reason)
+        let reason = if self.reason.engaged() {
+            Refusal::Steering
+        } else {
+            self.reason
+        };
+        (self.active, self.blocked, self.target, reason)
     }
 
     fn steer(
@@ -536,10 +553,10 @@ impl Aim {
         // not every press since the program started.
         if active && !self.active {
             self.sent = [0; 2];
+            self.target = None;
+            self.offset = Offset::default();
         }
         self.active = active;
-        self.target = None;
-        self.offset = Offset::default();
 
         self.reason = match self.aim_at(active, held, me, players, angles) {
             Err(refusal) => refusal,
@@ -569,12 +586,18 @@ impl Aim {
         angles: ViewAngles,
     ) -> Result<[i32; 2], Refusal> {
         if !active {
+            // Returning before the target is cleared, on purpose: the line
+            // written when the button is let go then still says which enemy
+            // the view was on and how far off it ended, which is the only
+            // moment anyone wants to know it.
             return Err(if held {
                 Refusal::NotInFront
             } else {
                 Refusal::NotHeld
             });
         }
+        self.target = None;
+        self.offset = Offset::default();
         // Our own side is what every enemy test is made against, so a bad
         // reading of it would make targets of teammates.
         let me = me
