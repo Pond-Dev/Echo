@@ -63,7 +63,15 @@ impl Log {
             return;
         };
         let elapsed = self.started.elapsed().as_secs_f64();
-        for line in message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Trailing whitespace goes, leading whitespace stays: the breakdown
+        // nests sub-stages under the stage they belong to, and flattening that
+        // puts a share of the drawing next to a share of the frame with
+        // nothing to tell them apart.
+        for line in message
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+        {
             // A failed write means the log is gone, not that the run stops.
             let _ = writeln!(file, "[{elapsed:9.3}] {line}");
         }

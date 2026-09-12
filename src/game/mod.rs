@@ -5,8 +5,11 @@
 
 use crate::process::{AttachError, Module, Process};
 
+pub use projection::ViewMatrix;
+
 pub mod entities;
 pub mod offsets;
+pub mod projection;
 
 const EXE: &str = "cs2.exe";
 const CLIENT_MODULE: &str = "client.dll";
@@ -38,6 +41,11 @@ impl Game {
         self.process.pid()
     }
 
+    /// Reads made since this was last called, and reset.
+    pub fn take_reads(&self) -> u64 {
+        self.process.take_reads()
+    }
+
     /// Confirm `client.dll` really is a loaded PE image. Cheap sanity check
     /// that separates "attached to the wrong thing" from "offset is stale".
     pub fn client_looks_like_a_module(&self) -> windows::core::Result<bool> {
@@ -48,11 +56,31 @@ impl Game {
 
     /// Where the player is currently looking.
     pub fn view_angles(&self) -> windows::core::Result<ViewAngles> {
-        let address = self.client.base + offsets::module::VIEW_ANGLES;
+        // Both floats in one read. They are adjacent, so two reads would pay
+        // twice for the same page and could straddle a write between them.
+        let mut bytes = [0u8; 8];
+        self.process
+            .read(self.client.base + offsets::module::VIEW_ANGLES, &mut bytes)?;
         Ok(ViewAngles {
-            pitch: self.process.read_f32(address)?,
-            yaw: self.process.read_f32(address + 4)?,
+            pitch: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            yaw: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         })
+    }
+
+    /// The matrix the game is currently rendering with.
+    ///
+    /// Read in one go rather than field by field: the game rewrites it every
+    /// frame, and sixteen separate reads could straddle a write and mix two
+    /// matrices into one that projects to nowhere real.
+    pub fn view_matrix(&self) -> windows::core::Result<ViewMatrix> {
+        let mut bytes = [0u8; 64];
+        self.process
+            .read(self.client.base + offsets::module::VIEW_MATRIX, &mut bytes)?;
+        let mut values = [0f32; 16];
+        for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(4)) {
+            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Ok(ViewMatrix::from_raw(values))
     }
 
     /// The local player, when there is one.

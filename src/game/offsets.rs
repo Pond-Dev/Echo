@@ -42,6 +42,9 @@ pub mod module {
     /// Pointer to the entity system, which owns the chunk table every other
     /// entity is reached through.
     pub const ENTITY_SYSTEM: usize = client_dll::dwEntityList;
+
+    /// The 4x4 matrix the game renders with: sixteen `f32` in a row.
+    pub const VIEW_MATRIX: usize = client_dll::dwViewMatrix;
 }
 
 /// Field positions inside an entity, relative to the entity's own address.

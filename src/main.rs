@@ -1,29 +1,36 @@
-//! Echo — step 5: draw on top of the game.
+//! Echo — step 6: draw boxes on the enemies.
 //!
-//! Four steps of reading memory end here; this one puts something on screen.
-//! An always-on-top, click-through window is laid over the game's client area
-//! and a border, a centre marker and a few lines of text are drawn into it.
+//! The first thing here that is actually useful. Steps one to four found out
+//! where players are in the world; step five put a window over the game. This
+//! joins them with the matrix the game renders with, so a place in the world
+//! becomes a place on the screen.
 //!
-//! Nothing drawn comes from the world yet — that is step 6. What this proves
-//! is that the window lands in the right place, that the game shows through
-//! everywhere we did not draw, and that the mouse still reaches the game.
+//! Every stage of that can refuse: no side to compare against, no position
+//! read this pass, a player behind the camera. Each one skips the box rather
+//! than guessing at it — a box drawn on a teammate is worse than no box.
 //!
-//! The check is your eyes: the border should hug the picture, the marker
-//! should sit around the game's own crosshair, and shooting should still work.
+//! The check is your eyes: boxes should sit on enemies, follow them as they
+//! move, shrink with distance, and never appear on your own team.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use echo::console::Screen;
-use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles};
+use echo::game::{Game, LocalPlayer, Player, Team, ViewMatrix};
 use echo::log::Log;
-use echo::overlay::{Overlay, rgb};
+use echo::overlay::{FrameCost, Overlay, rgb};
 use echo::process::AttachError;
 use windows::core::w;
 
-const POLL: Duration = Duration::from_millis(100);
+/// Target frame time. The game draws far faster than this, so a box is always
+/// a little behind; the gap is what makes it float when the view swings.
+const FRAME: Duration = Duration::from_millis(8);
+/// How often to look for the game's window again while there is no overlay.
+const ATTACH_RETRY: Duration = Duration::from_millis(500);
+/// How often the achieved rate is written to the log.
+const PACE_REPORT: Duration = Duration::from_secs(2);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-const ACCENT: windows::Win32::Foundation::COLORREF = rgb(0, 220, 120);
+const ENEMY: windows::Win32::Foundation::COLORREF = rgb(255, 70, 70);
 const TEXT: windows::Win32::Foundation::COLORREF = rgb(235, 235, 235);
+const WARN: windows::Win32::Foundation::COLORREF = rgb(255, 190, 60);
 
 fn main() {
     let mut log = Log::create();
@@ -56,31 +63,55 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         return Ok(());
     }
 
-    let screen = Screen::new();
-    let mut overlay = Overlay::over(GAME_WINDOW)?;
-    match &overlay {
-        Some(overlay) => log.record(&format!("overlay over {:?}", overlay.bounds())),
-        None => log.record("no game window — the overlay will not be shown"),
-    }
+    // Retried rather than built once: the game window may not exist yet at
+    // startup, may go away and come back, and there is no console readout any
+    // more — an overlay that gave up would leave the program running silently
+    // forever with nothing on screen.
+    let mut overlay: Option<Overlay> = None;
+    let mut next_attach = Instant::now();
 
     let mut last_logged = None;
+    let mut next_pace = Instant::now();
+    let mut pace = Pace::default();
     loop {
-        let angles = game.view_angles()?;
-        let me = game.local_player()?;
-        let mut players = game.players()?;
+        let started = Instant::now();
+
+        let mut stages = Stages::default();
+        let me = Stages::time(&mut stages.me, || game.local_player())?;
+        let mut players = Stages::time(&mut stages.players, || game.players())?;
         // Enemies first, then teammates, then everyone else; stable within a
         // group by slot so the list does not jump around between frames.
         players.sort_by_key(|player| rank(*player, me));
 
-        screen.draw(&frame(&game, angles, me, &players));
+        // The matrix is read last, right before it is used. It is what decides
+        // where a box lands, and reading six hundred player values after it
+        // would leave it a whole pass out of date — which is a box that
+        // floats behind the enemy whenever the view swings.
+        let view = Stages::time(&mut stages.matrix, || game.view_matrix())?;
 
-        if let Some(overlay) = overlay.as_mut() {
-            overlay.pump();
-            if overlay.target_is_alive() {
-                overlay.follow_target();
-                draw_overlay(overlay, angles, me, &players);
+        // Drop an overlay whose window has gone, so the next attempt builds a
+        // fresh one over the game's new window rather than drawing into a
+        // handle that no longer names anything.
+        if overlay.as_ref().is_some_and(|o| !o.target_is_alive()) {
+            log.record("game window gone — dropping the overlay");
+            overlay = None;
+        }
+        if overlay.is_none() && started >= next_attach {
+            overlay = Overlay::over(GAME_WINDOW)?;
+            match &overlay {
+                Some(overlay) => log.record(&format!("overlay over {:?}", overlay.bounds())),
+                None => next_attach = started + ATTACH_RETRY,
             }
         }
+
+        if let Some(overlay) = overlay.as_mut() {
+            Stages::time(&mut stages.pump, || overlay.pump());
+            Stages::time(&mut stages.follow, || overlay.follow_target());
+            stages.drawing = Stages::time(&mut stages.overlay, || {
+                draw_overlay(overlay, view, me, &players, pace)
+            });
+        }
+        stages.reads = game.take_reads();
 
         // The log records the roster, not the movement. Fourteen players
         // walking around change their positions every single pass, and a file
@@ -88,57 +119,280 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         // is running. What is worth finding afterwards is who was present, on
         // which side, and whether they were alive — so that is the key.
         let roster = roster(me, &players);
-        if last_logged.as_ref() != Some(&roster) {
-            for line in records(me, &players) {
-                log.record(&line);
+        let due_report = started >= next_pace;
+        Stages::time(&mut stages.log, || {
+            if last_logged.as_ref() != Some(&roster) {
+                for line in records(me, &players) {
+                    log.record(&line);
+                }
+                last_logged = Some(roster);
             }
-            last_logged = Some(roster);
+
+            // Whether the loop is keeping up belongs in the file, not only on
+            // the screen: the screen is gone by the time anyone asks why the
+            // boxes lagged. The breakdown is one frame behind as a result,
+            // which is the price of measuring the thing that reports it.
+            if due_report {
+                for line in pace.report() {
+                    log.record(&line);
+                }
+            }
+        });
+        if due_report {
+            next_pace = started + PACE_REPORT;
         }
 
-        std::thread::sleep(POLL);
+        pace.finish(started.elapsed(), stages, started);
     }
 }
 
-/// Step 5 draws nothing derived from the world yet — that is step 6. What it
-/// proves is that the window is in the right place, that the game shows
-/// through it, and that it does not eat the mouse.
+/// Where a frame's time went, one named stage at a time.
+///
+/// A single number for the whole pass says only whether it is keeping up, not
+/// which part to work on. That was the defect the old product carried: a
+/// measurement that could attribute a cost to a phase and no further, so the
+/// investigation stopped there and refining it meant restructuring first.
+///
+/// The rule that follows: nothing is a stage until it has a name.
+#[derive(Clone, Copy, Default)]
+struct Stages {
+    me: Duration,
+    players: Duration,
+    matrix: Duration,
+    overlay: Duration,
+    /// Writing to the log. Measured because it is file I/O in the middle of
+    /// the frame, and the one part of the loop still unaccounted for when the
+    /// stages added up to far less than the frame did.
+    log: Duration,
+    /// Reading the overlay's own message queue.
+    pump: Duration,
+    /// Keeping the overlay over the game and on top of it. Asks the window
+    /// manager to move a window every frame, which is not obviously cheap —
+    /// and was four fifths of the overlay's time before it had a name.
+    follow: Duration,
+    /// Reads made this frame. The other currency: each is a system call into
+    /// another process, and a stage can be slow either by doing expensive work
+    /// or by doing many cheap reads.
+    reads: u64,
+    /// What the overlay's own time went on. `overlay` above is one number for
+    /// the whole of it, which is exactly as useful as one number for the whole
+    /// frame was.
+    drawing: FrameCost,
+}
+
+impl Stages {
+    /// Run `work`, adding what it took to `slot`.
+    fn time<T>(slot: &mut Duration, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let value = work();
+        *slot = started.elapsed();
+        value
+    }
+
+    fn total(self) -> Duration {
+        self.me + self.players + self.matrix + self.overlay + self.pump + self.follow + self.log
+    }
+
+    /// One line per stage, worst first, with its share of the frame. Sorted so
+    /// the line that matters is the one at the top rather than the one whose
+    /// name comes first alphabetically.
+    fn breakdown(self) -> Vec<String> {
+        let total = self.total().as_secs_f64().max(1e-9);
+        let mut rows = [
+            ("read players", self.players),
+            ("draw overlay", self.overlay),
+            ("read matrix", self.matrix),
+            ("read me", self.me),
+            ("write log", self.log),
+            ("pump messages", self.pump),
+            ("follow window", self.follow),
+        ];
+        rows.sort_by_key(|(_, took)| std::cmp::Reverse(*took));
+
+        let mut lines = vec![format!(
+            "  {:<14} {:>7.3} ms   {} reads",
+            "stages total",
+            total * 1000.0,
+            self.reads
+        )];
+        lines.extend(rows.iter().map(|(name, took)| {
+            let ms = took.as_secs_f64() * 1000.0;
+            format!(
+                "  {name:<14} {ms:>7.3} ms   {:>4.1}%",
+                ms / (total * 1000.0) * 100.0
+            )
+        }));
+        lines.extend(self.drawing.breakdown());
+        lines
+    }
+}
+
+/// Holds the loop to a rate, and remembers whether it managed it.
+///
+/// Paced by deadline, not by delay: sleeping a fixed amount *after* the work
+/// makes the period the work plus the sleep plus whatever the operating system
+/// adds, so the achieved rate is always well under the target and the miss
+/// grows with the work. Sleeping only the remainder of the frame keeps the
+/// period at the target until the work alone exceeds it.
+///
+/// This is the one defect the old product carried its whole life, worth about
+/// a quarter of its rate. Not repeating it costs two lines.
+#[derive(Clone, Copy, Default)]
+struct Pace {
+    /// How long the work took last frame.
+    last: Duration,
+    /// The whole period between one frame starting and the next — work, sleep,
+    /// sleep overshoot and whatever the scheduler took. Computing a rate from
+    /// the target instead would print the target back and never show a miss,
+    /// which is the same class of error as pacing by delay.
+    period: Duration,
+    /// The worst frame since the last report. Reset each time it is read, so
+    /// one stall at startup does not hide every stall after it.
+    worst: Duration,
+    /// What that worst frame was doing.
+    ///
+    /// Without this the report describes whichever frame happened to land on
+    /// the two-second mark — an ordinary one — and says nothing about the one
+    /// that actually missed. Chasing a tail means sampling the tail.
+    worst_stages: Stages,
+    /// When the previous frame began, for measuring the period.
+    previous_start: Option<Instant>,
+}
+
+impl Pace {
+    fn finish(&mut self, elapsed: Duration, stages: Stages, started: Instant) {
+        self.period = self.previous_start.map_or(Duration::ZERO, |previous| {
+            started.saturating_duration_since(previous)
+        });
+        self.previous_start = Some(started);
+        self.last = elapsed;
+        if elapsed > self.worst {
+            self.worst = elapsed;
+            self.worst_stages = stages;
+        }
+        if let Some(remaining) = FRAME.checked_sub(elapsed) {
+            std::thread::sleep(remaining);
+        }
+    }
+
+    /// What the loop is actually achieving, and what it could achieve if it
+    /// never slept — the second is what says whether the target is realistic.
+    ///
+    /// Read-only, because the live readouts call this every frame.
+    fn describe(&self) -> String {
+        let work = self.last.as_secs_f64().max(1e-9);
+        let period = self.period.as_secs_f64();
+        let rate = if period > 0.0 {
+            format!("{:.1} Hz", 1.0 / period)
+        } else {
+            "— Hz".to_owned()
+        };
+        format!(
+            "{rate}   work {:.2} ms (worst {:.2})   ceiling {:.0} Hz",
+            self.last.as_secs_f64() * 1000.0,
+            self.worst.as_secs_f64() * 1000.0,
+            1.0 / work,
+        )
+    }
+
+    /// The report for the log: the summary, then the worst frame's breakdown.
+    /// Starts a new worst-case window.
+    ///
+    /// Only the log resets it. A worst case that never resets is dominated
+    /// forever by the first frame, where the window is still being created;
+    /// one that resets on every read — which is what the live readouts would
+    /// do — never accumulates anything at all.
+    fn report(&mut self) -> Vec<String> {
+        let mut lines = vec![self.describe(), "  worst frame:".to_owned()];
+        lines.extend(self.worst_stages.breakdown());
+        self.worst = Duration::ZERO;
+        self.worst_stages = Stages::default();
+        lines
+    }
+}
+
+/// How tall a standing player is, in world units.
+///
+/// ponytail: one constant. Crouching makes a player shorter and this will draw
+/// a box too tall for them; read the real bounds when that starts to matter.
+const PLAYER_HEIGHT: f32 = 72.0;
+
+/// How wide a box is as a fraction of its own height on screen. Deriving the
+/// width from the height keeps the box the same shape at every distance, which
+/// a fixed pixel width would not.
+const BOX_ASPECT: f32 = 0.45;
+
+/// Draw a box around each living enemy.
+///
+/// Only enemies, only living ones, and only those the projection places in
+/// front of the camera. Every one of those is a refusal to draw rather than a
+/// guess, because a box drawn on a teammate is worse than no box at all.
 fn draw_overlay(
-    overlay: &Overlay,
-    angles: ViewAngles,
+    overlay: &mut Overlay,
+    view: ViewMatrix,
     me: Option<LocalPlayer>,
     players: &[Player],
-) {
+    pace: Pace,
+) -> FrameCost {
     let bounds = overlay.bounds();
     overlay.frame(|canvas| {
-        // A border on the client area. If this hugs the picture, the overlay
-        // is aligned; if it is off, the sizing is wrong and every box drawn
-        // later would be wrong the same way.
-        canvas.rect(0, 0, bounds.width - 1, bounds.height - 1, ACCENT, 1);
+        // Nothing is drawn from a reading that failed its own check. Our own
+        // side is the reference every enemy test is made against, so a bad
+        // reading of it turns everyone into a target — teammates included.
+        let Some(me) = me.filter(|me| me.plausible()) else {
+            canvas.text(12, 12, "readings implausible — stale offsets?", WARN);
+            return;
+        };
 
-        // Centre marker. The game's own crosshair should sit inside it.
-        let (cx, cy) = (bounds.width / 2, bounds.height / 2);
-        canvas.line((cx - 12, cy), (cx - 4, cy), ACCENT, 1);
-        canvas.line((cx + 4, cy), (cx + 12, cy), ACCENT, 1);
-        canvas.line((cx, cy - 12), (cx, cy - 4), ACCENT, 1);
-        canvas.line((cx, cy + 4), (cx, cy + 12), ACCENT, 1);
+        let mut drawn = 0usize;
+        let mut rejected = 0usize;
+        for player in players {
+            if !player.plausible() {
+                rejected += 1;
+                continue;
+            }
+            if !me.team.opposes(player.team) || !player.alive() {
+                continue;
+            }
+            let Some(feet) = player.origin else { continue };
+            let head = [feet[0], feet[1], feet[2] + PLAYER_HEIGHT];
 
-        let enemies = players
-            .iter()
-            .filter(|p| me.is_some_and(|me| me.team.opposes(p.team)) && p.alive())
-            .count();
-        let status = [
-            format!("echo  {}x{}", bounds.width, bounds.height),
-            format!("pitch {:.1}  yaw {:.1}", angles.pitch, angles.yaw),
-            match me {
-                Some(me) => format!("{} health {}", me.team.label(), me.health),
-                None => "no pawn".to_owned(),
-            },
-            format!("{} players, {enemies} enemies alive", players.len()),
-        ];
-        for (row, line) in status.iter().enumerate() {
-            canvas.text(12, 12 + row as i32 * 18, line, TEXT);
+            // Both ends must be in front of the camera. Projecting only one
+            // and guessing the other is how a box ends up stretched across
+            // the whole screen when a player is half behind us.
+            let (Some(bottom), Some(top)) = (
+                view.project(feet, bounds.width, bounds.height),
+                view.project(head, bounds.width, bounds.height),
+            ) else {
+                continue;
+            };
+
+            let height = bottom.1 - top.1;
+            if height <= 0 {
+                continue;
+            }
+            let width = (height as f32 * BOX_ASPECT).round() as i32;
+            canvas.rect(top.0 - width / 2, top.1, width, height, ENEMY, 2);
+            drawn += 1;
         }
-    });
+
+        let mut status = vec![
+            format!("echo  {}x{}", bounds.width, bounds.height),
+            format!("{} health {}", me.team.label(), me.health),
+            format!("{drawn} enemies on screen of {}", players.len()),
+            pace.describe(),
+        ];
+        // Readings that failed their check are called out rather than being
+        // silently skipped: a count that climbs is what a game update looks
+        // like from here.
+        if rejected > 0 {
+            status.push(format!("{rejected} implausible — stale offsets?"));
+        }
+        for (row, line) in status.iter().enumerate() {
+            let colour = if row == 4 { WARN } else { TEXT };
+            canvas.text(12, 12 + row as i32 * 18, line, colour);
+        }
+    })
 }
 
 /// Sort key: enemies, then teammates, then the rest.
@@ -149,83 +403,6 @@ fn rank(player: Player, me: Option<LocalPlayer>) -> (u8, usize) {
         _ => 2,
     };
     (group, player.controller)
-}
-
-fn frame(
-    game: &Game,
-    angles: ViewAngles,
-    me: Option<LocalPlayer>,
-    players: &[Player],
-) -> Vec<String> {
-    let client = game.client();
-    let mut lines = vec![
-        format!("echo — pid {}   client.dll 0x{:X}", game.pid(), client.base),
-        String::new(),
-    ];
-
-    lines.push(if angles.plausible() {
-        format!(
-            "  view    pitch {:>7.2}   yaw {:>8.2}",
-            angles.pitch, angles.yaw
-        )
-    } else {
-        format!("  view    implausible ({} {})", angles.pitch, angles.yaw)
-    });
-
-    lines.push(match me {
-        None => "  me      no pawn — menu, between rounds, or spectating".to_owned(),
-        Some(me) if !me.plausible() => format!("  me      health implausible ({})", me.health),
-        Some(me) => format!(
-            "  me      {:<4} health {:>4}{}",
-            me.team.label(),
-            me.health,
-            if me.alive() { "" } else { "   dead" }
-        ),
-    });
-
-    lines.push(String::new());
-    if players.is_empty() {
-        lines.push("  no players — not in a server".to_owned());
-        return lines;
-    }
-
-    let enemies = players
-        .iter()
-        .filter(|p| me.is_some_and(|me| me.team.opposes(p.team)) && p.alive())
-        .count();
-    lines.push(format!(
-        "  {} players, {enemies} enemies alive",
-        players.len()
-    ));
-    lines.push(String::new());
-    lines.push("  side  health  position                        relation".to_owned());
-    for player in players {
-        lines.push(describe(*player, me));
-    }
-    lines
-}
-
-fn describe(player: Player, me: Option<LocalPlayer>) -> String {
-    let position = match player.origin {
-        Some([x, y, z]) => format!("{x:>9.1} {y:>9.1} {z:>9.1}"),
-        None => "       — no scene node —".to_owned(),
-    };
-    let relation = match me {
-        Some(me) if me.pawn == player.pawn => "me",
-        Some(me) if me.team.opposes(player.team) => "ENEMY",
-        Some(me) if me.team == player.team => "team",
-        _ => "",
-    };
-    let health = if player.plausible() {
-        format!("{:>6}", player.health)
-    } else {
-        format!("{:>6}?", player.health)
-    };
-    format!(
-        "  {:<4}{health}  {position}    {relation}{}",
-        player.team.label(),
-        if player.alive() { "" } else { "  (dead)" }
-    )
 }
 
 /// What makes this pass different from the last one, for the log's purposes.

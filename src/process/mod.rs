@@ -4,6 +4,7 @@
 //! knowledge lives in this module, which is why a game update cannot touch
 //! it.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::size_of;
 
@@ -50,10 +51,15 @@ pub struct Module {
 }
 
 /// An open, read-only handle to another process. Closes itself on drop.
+///
+/// Counts its reads. Each one is a system call into another process's address
+/// space, which makes the count the honest unit of cost here — far more so
+/// than the number of values, since one read can carry many of them.
 #[derive(Debug)]
 pub struct Process {
     handle: HANDLE,
     pid: u32,
+    reads: Cell<u64>,
 }
 
 impl Process {
@@ -72,11 +78,20 @@ impl Process {
                 Err(error) => return Err(error.into()),
             };
 
-        Ok(Self { handle, pid })
+        Ok(Self {
+            handle,
+            pid,
+            reads: Cell::new(0),
+        })
     }
 
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Reads made since the counter was last taken, and reset.
+    pub fn take_reads(&self) -> u64 {
+        self.reads.replace(0)
     }
 
     /// Look up a loaded module by name. `None` means it is not loaded yet,
@@ -114,6 +129,7 @@ impl Process {
     /// Fill `out` from `address`. A short read is an error: a partially filled
     /// buffer is indistinguishable from real data once it is returned.
     pub fn read(&self, address: usize, out: &mut [u8]) -> windows::core::Result<()> {
+        self.reads.set(self.reads.get() + 1);
         let mut read = 0usize;
         unsafe {
             ReadProcessMemory(
