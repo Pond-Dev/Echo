@@ -168,6 +168,31 @@ pub struct Steering {
     /// the head is doing the aiming, and the product is named for the
     /// difference.
     pub aim_height: f32,
+    /// How far out the view has to be before a pull starts at all, in world
+    /// units.
+    ///
+    /// The problem this exists for was written down as helping where a hand
+    /// is bad, and for a long time nothing in the code said that — it pulled
+    /// from any distance past the handover, including the distances the
+    /// player was already handling.
+    ///
+    /// The cost was measured. A hundred and forty seconds played with the
+    /// assist watching: two hundred and seventy-six hits, a quarter of them
+    /// headshots. Eighty-six seconds with it steering: the same hits a
+    /// minute, a third fewer kills, and the headshot rate halved. The
+    /// mechanism is not subtle — a player lining up a head is fifteen or so
+    /// units above the chest, which the pull read as being off target and
+    /// corrected downwards.
+    ///
+    /// Their own aim sits between five and seventeen units out when they are
+    /// aiming, and past a hundred when they are still turning. Forty is in
+    /// the gap: clear of everything they do for themselves, well under the
+    /// part they are slow at.
+    ///
+    /// Only about starting. A pull already under way runs to the handover,
+    /// because stopping it halfway would leave the view somewhere neither of
+    /// them chose.
+    pub engage_beyond: f32,
     /// How far from the aim point the pull may stop, in world units.
     ///
     /// Worked out against the target's distance rather than fixed, since the
@@ -301,6 +326,7 @@ pub const STEERING: Steering = Steering {
     // the assist stops accelerating and starts coasting.
     cap: 60.0,
     deadzone: 0.15,
+    engage_beyond: 40.0,
     // High enough that a live pass always moves something. The smallest
     // movement worth making is the deadzone, and at this gain a quarter of
     // strength rounded that to nothing — a band where the assist counted as
@@ -580,18 +606,26 @@ impl Steering {
         choice
     }
 
+    /// The angle a length subtends at this distance, never under the width
+    /// below which a movement is a tremble rather than aim.
+    fn angle_of(self, length: f32, distance: f32) -> f32 {
+        if !distance.is_finite() || distance <= 0.0 {
+            return self.deadzone;
+        }
+        (length / distance).atan().to_degrees().max(self.deadzone)
+    }
+
+    /// The angle past which a pull is worth starting, at this distance.
+    pub fn engage(self, distance: f32) -> f32 {
+        self.angle_of(self.engage_beyond, distance)
+    }
+
     /// The angle at which a target this far away is close enough.
     ///
     /// Never under the deadzone, which is the width below which a movement is
     /// a tremble rather than aim.
     pub fn handover(self, distance: f32) -> f32 {
-        if !distance.is_finite() || distance <= 0.0 {
-            return self.deadzone;
-        }
-        (self.settle_within / distance)
-            .atan()
-            .to_degrees()
-            .max(self.deadzone)
+        self.angle_of(self.settle_within, distance)
     }
 
     fn decide(
@@ -689,6 +723,13 @@ impl Steering {
         if choice.arrived {
             return Err(Refusal::Delivered);
         }
+        // Nothing that a hand is not already bad at. A pull under way runs to
+        // the handover — `pulling_for` is what says one is — but one that has
+        // not started does not start for a view the player is plainly aiming
+        // with.
+        if now.pulling_for.is_zero() && offset.size() < self.engage(distance) {
+            return Err(Refusal::AlreadyClose);
+        }
         // A pull that is not getting there is not going to, and carrying on
         // means steering through a magazine.
         if now.pulling_for > self.pull_limit {
@@ -755,6 +796,7 @@ pub enum Refusal {
     NoEnemyInTheCone,
     HandWins,
     Easing,
+    AlreadyClose,
     Watching,
     Delivered,
     PullSpent,
@@ -783,7 +825,7 @@ impl Refusal {
     /// Listed rather than derived, and held to the real list by a test: a
     /// reason missing from here would be a reason nothing ever reports, which
     /// is the exact shape of the failure the tally exists to catch.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::NotHeld,
         Self::NotInFront,
         Self::NoLocalPlayer,
@@ -794,6 +836,7 @@ impl Refusal {
         Self::NoEnemyInTheCone,
         Self::HandWins,
         Self::Easing,
+        Self::AlreadyClose,
         Self::Watching,
         Self::Delivered,
         Self::PullSpent,
@@ -825,12 +868,13 @@ impl Refusal {
             Self::NoEnemyInTheCone => 7,
             Self::HandWins => 8,
             Self::Easing => 9,
-            Self::Watching => 10,
-            Self::Delivered => 11,
-            Self::PullSpent => 12,
-            Self::PullGaveUp => 13,
-            Self::WindowsRefused => 14,
-            Self::Steering => 15,
+            Self::AlreadyClose => 10,
+            Self::Watching => 11,
+            Self::Delivered => 12,
+            Self::PullSpent => 13,
+            Self::PullGaveUp => 14,
+            Self::WindowsRefused => 15,
+            Self::Steering => 16,
         }
     }
 
@@ -847,6 +891,7 @@ impl Refusal {
             Self::NoPositionForUs => "no-position",
             Self::NoEnemyInTheCone => "no-enemy",
             Self::HandWins => "hand",
+            Self::AlreadyClose => "already-close",
             Self::Watching => "watching",
             Self::Delivered => "delivered",
             Self::PullSpent => "pull-spent",
@@ -868,6 +913,7 @@ impl Refusal {
             Self::NoPositionForUs => "our own position is not readable",
             Self::NoEnemyInTheCone => "no living enemy in the cone",
             Self::HandWins => "your hand",
+            Self::AlreadyClose => "already close enough to be your own shot",
             Self::Watching => "watching — would have steered",
             Self::Delivered => "delivered — the rest is yours",
             Self::PullSpent => "this press has had its pull, on someone else",
@@ -893,6 +939,7 @@ mod tests {
             gain: 0.5,
             cap: 200.0,
             deadzone: 0.2,
+            engage_beyond: 40.0,
             least_grip: 0.25,
             settle_within: 6.0,
             pull_limit: Duration::from_millis(300),
@@ -1466,6 +1513,51 @@ mod tests {
         let players = facing_east(&[close_and_wide, far_and_ahead]);
         let choice = STEERING.choose(&situation(&players), ramp(), 1.0, 0.0);
         assert_eq!(choice.target, Some(0x3000));
+    }
+
+    #[test]
+    fn a_view_the_player_is_plainly_aiming_with_is_left_alone() {
+        // Measured: playing with the assist steering cost a third of the
+        // kills and half the headshots of playing without it, because a
+        // player lining up a head sits a little above the chest and the pull
+        // read that as being off target.
+        let engage = STEERING.engage(1000.0);
+        let handover = STEERING.handover(1000.0);
+        assert!(engage > handover, "{engage} against {handover}");
+
+        // Just inside the distance a hand manages for itself: untouched, and
+        // said so rather than silently.
+        let sideways = (1000.0 * (engage.to_radians()).tan()) * 0.9;
+        let close = facing_east(&[enemy(0x2000, [1000.0, sideways, 9.0])]);
+        assert_eq!(
+            STEERING.choose(&situation(&close), ramp(), 1.0, 0.0).counts,
+            Err(Refusal::AlreadyClose)
+        );
+
+        // Well outside it: helped.
+        let far = facing_east(&[enemy(0x2000, [1000.0, sideways * 3.0, 9.0])]);
+        assert!(
+            STEERING
+                .choose(&situation(&far), ramp(), 1.0, 0.0)
+                .counts
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_pull_already_under_way_runs_to_the_handover_and_not_to_the_start_line() {
+        // Stopping halfway would leave the view somewhere neither of them
+        // chose, which is worse than either helping or not helping.
+        let engage = STEERING.engage(1000.0);
+        let sideways = (1000.0 * engage.to_radians().tan()) * 0.9;
+        let close = facing_east(&[enemy(0x2000, [1000.0, sideways, 9.0])]);
+
+        let mut now = situation(&close);
+        now.pulling_for = Duration::from_millis(20);
+        assert!(
+            STEERING.choose(&now, ramp(), 1.0, 0.0).counts.is_ok(),
+            "a pull under way carries on"
+        );
     }
 
     #[test]
