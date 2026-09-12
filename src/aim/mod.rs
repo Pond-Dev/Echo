@@ -12,6 +12,13 @@
 //! arrive — a movement that falls short is made up next pass, and the one
 //! number that converts degrees into mouse counts can be well off before the
 //! behaviour changes from "arrives quickly" to "arrives slowly".
+//!
+//! Nothing in here switches on or off. Every edge is a curve, in both of the
+//! places an edge would otherwise be felt. A movement asked for approaches
+//! its ceiling instead of striking it, so there is no distance at which the
+//! assist stops accelerating and starts coasting. And the strength it steers
+//! with rises and falls over time rather than between two passes, so pushing
+//! against it meets a grip that eases off rather than one that lets go.
 
 use std::time::Duration;
 
@@ -77,12 +84,18 @@ pub struct Steering {
     /// settles. At one it would arrive in a single pass if every number were
     /// exact, and past one it would overshoot further every pass.
     pub gain: f32,
-    /// The most counts one pass may send on one axis.
+    /// The ceiling one pass approaches but never reaches, on one axis.
     ///
-    /// The ceiling on what a wrong reading can do. Without it, a position read
-    /// mid-write asks for a movement of any size at all, and the view is
-    /// somewhere else before the next pass can disagree.
-    pub cap: i32,
+    /// The limit on what a wrong reading can do: a position caught mid-write
+    /// asks for a movement of any size at all, and without a ceiling the view
+    /// is somewhere else before the next pass can disagree.
+    ///
+    /// Approached rather than enforced. A hard limit is a corner — small
+    /// movements grow with the distance and large ones all come out the same
+    /// size, and the distance where that changes is felt as the assist going
+    /// from accelerating to coasting. A curve that bends towards the ceiling
+    /// has no such place in it.
+    pub cap: f32,
     /// Below this many degrees the view is treated as already there.
     ///
     /// A target is not a point: it is a person, several degrees wide at the
@@ -99,10 +112,14 @@ pub struct Steering {
 }
 
 impl Steering {
-    /// The mouse movement that closes `offset`, or nothing when it is already
-    /// close enough.
-    pub fn counts(self, offset: Offset) -> Option<[i32; 2]> {
-        if !offset.size().is_finite() || offset.size() < self.deadzone {
+    /// The mouse movement that closes `offset` at this much of full strength,
+    /// or nothing when there is nothing worth sending.
+    ///
+    /// `grip` runs from nothing to one and scales what is sent after the
+    /// ceiling rather than before it, so the ceiling always means the most a
+    /// pass may move at full strength and not some fraction of it.
+    pub fn counts(self, offset: Offset, grip: f32) -> Option<[i32; 2]> {
+        if !offset.size().is_finite() || !grip.is_finite() || offset.size() < self.deadzone {
             return None;
         }
         let scale = self.counts_per_degree * self.gain;
@@ -110,8 +127,8 @@ impl Steering {
         // which the engine records as yaw falling. Pitch is not: a count
         // downwards looks downwards, which it records as pitch rising.
         let movement = [
-            clamp_counts(-offset.yaw * scale, self.cap),
-            clamp_counts(offset.pitch * scale, self.cap),
+            soften(-offset.yaw * scale, self.cap, grip),
+            soften(offset.pitch * scale, self.cap, grip),
         ];
         (movement != [0, 0]).then_some(movement)
     }
@@ -122,24 +139,23 @@ impl Steering {
     }
 }
 
-/// Rounded, then held inside the cap — and never turned into a movement of
-/// nothing by the rounding, since a fraction of a count still means the view
-/// is not there yet.
-fn clamp_counts(counts: f32, cap: i32) -> i32 {
-    if !counts.is_finite() {
+/// Bent towards the ceiling, scaled by the grip, and rounded.
+///
+/// `tanh` because it is the curve that is already the identity for small
+/// values and already the ceiling for large ones, with everything in between
+/// bending between the two and no point anywhere along it where the slope
+/// changes suddenly. A movement well inside the ceiling is left alone, which
+/// is what keeps the approach to a target unchanged.
+fn soften(counts: f32, cap: f32, grip: f32) -> i32 {
+    if !counts.is_finite() || cap <= 0.0 {
         return 0;
     }
-    let rounded = if counts.abs() < 1.0 {
-        counts.signum() * counts.abs().ceil()
-    } else {
-        counts.round()
-    };
-    (rounded as i32).clamp(-cap, cap)
+    (cap * (counts / cap).tanh() * grip.clamp(0.0, 1.0)).round() as i32
 }
 
-/// When the player takes the view back.
+/// How the strength the assist steers with rises and falls.
 #[derive(Clone, Copy, Debug)]
-pub struct Yield {
+pub struct Ramp {
     /// Counts in one pass at or above which the hand is moving on purpose.
     ///
     /// A hand at rest does not report a small number — it reports nothing at
@@ -147,58 +163,88 @@ pub struct Yield {
     /// measured, so this only has to sit under the smallest movement anyone
     /// makes on purpose rather than above some noise floor.
     pub moving: i64,
-    /// How long the hand must be still before the assist steers again.
+    /// From nothing to full strength, with the hand still.
     ///
-    /// Yielding is immediate and coming back is not, and the asymmetry is the
-    /// point: without it the assist returns between two packets of a movement
-    /// still in progress and fights the second half of it.
-    pub settle: Duration,
+    /// Also what a hold begins with, since the strength is at nothing between
+    /// holds. So every press eases in rather than seizing the view, and a
+    /// hand still moving when the button goes down only delays the rise.
+    pub rise: Duration,
+    /// From full strength to nothing, with the hand pushing.
+    ///
+    /// Pushing against the assist meets a grip that eases off over this,
+    /// rather than one that lets go between two passes. The player still ends
+    /// with the view — the difference is that the handover can be felt
+    /// happening instead of arriving already done.
+    pub fall: Duration,
 }
 
-/// Whether the player is driving.
-///
-/// Asked again every pass, and never reset when the button goes down. Both
-/// matter, and the second is the more expensive to get wrong: the product
-/// this one replaces decided at the moment of the press, so pressing while
-/// the hand was moving — which is what every player does — skipped the whole
-/// hold. It was measured happening six times in every thirty seconds of play,
-/// and it is what "I pressed and nothing grabbed" was.
-///
-/// Here a hand that is moving when the button goes down costs the settle time
-/// and nothing more. The assist arrives late; it does not fail to arrive.
-#[derive(Clone, Copy, Debug)]
-pub struct Hand {
-    still_for: Duration,
-}
-
-impl Default for Hand {
-    fn default() -> Self {
-        // A hand nobody has touched has been still for as long as you like.
-        // Starting from zero would mean the assist could not work until the
-        // settle time had passed after the program started, which is a rule
-        // about nothing.
-        Self {
-            still_for: Duration::MAX,
-        }
+impl Ramp {
+    /// Whether the hand moved on purpose this pass.
+    ///
+    /// Per axis, not combined: a movement that is purely vertical is as
+    /// deliberate as one that is not, and adding the two would let a diagonal
+    /// of two small movements count as one large one.
+    pub fn moved(self, counts: [i64; 2]) -> bool {
+        counts[0].abs().max(counts[1].abs()) >= self.moving
     }
 }
 
-impl Hand {
-    /// Whether the player has the view this pass, so nothing may be sent.
+/// How firmly the assist is holding the view, from nothing to full.
+///
+/// Asked again every pass, and never told that a hold has begun. Both matter,
+/// and the second is the more expensive to get wrong: the product this one
+/// replaces decided at the moment of the press, so pressing while the hand
+/// was moving — which is what every player does — skipped the whole hold. It
+/// was measured happening six times in every thirty seconds of play, and it
+/// is what "I pressed and nothing grabbed" was.
+///
+/// Here a hand that is moving when the button goes down delays the rise and
+/// nothing else. The assist arrives late; it does not fail to arrive. Nothing
+/// in this knows what a hold is, which is what makes the old failure
+/// impossible rather than merely avoided.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Grip {
+    /// How far along the ramp, before the curve is applied.
     ///
-    /// `elapsed` is passed in rather than measured, so the rule can be tested
-    /// without waiting for a clock.
-    pub fn wins(&mut self, counts: [i64; 2], elapsed: Duration, rule: Yield) -> bool {
-        // Per axis, not combined: a movement that is purely vertical is as
-        // deliberate as one that is not, and adding the two would let a
-        // diagonal of two small movements count as one large one.
-        if counts[0].abs().max(counts[1].abs()) >= rule.moving {
-            self.still_for = Duration::ZERO;
-            return true;
-        }
-        self.still_for = self.still_for.saturating_add(elapsed);
-        self.still_for < rule.settle
+    /// Kept separately from the strength it produces so that the curve is
+    /// applied to the position and not compounded into it each pass, which
+    /// would make the rise depend on how often it was asked.
+    along: f32,
+}
+
+impl Grip {
+    /// Move the grip one pass towards where it should be, and say how firm it
+    /// is now.
+    ///
+    /// `elapsed` is passed in rather than measured, so the ramp can be tested
+    /// without waiting for a clock, and so the rise takes the same time at
+    /// any rate the loop happens to run at.
+    pub fn update(&mut self, wanted: bool, elapsed: Duration, ramp: Ramp) -> f32 {
+        let over = if wanted { ramp.rise } else { ramp.fall }.as_secs_f32();
+        let step = if over > 0.0 {
+            elapsed.as_secs_f32() / over
+        } else {
+            1.0
+        };
+        self.along = (self.along + if wanted { step } else { -step }).clamp(0.0, 1.0);
+        smooth(self.along)
     }
+
+    /// How firm it is, without moving it. For anything that only reports.
+    pub fn firmness(self) -> f32 {
+        smooth(self.along)
+    }
+}
+
+/// The curve that leaves both ends flat.
+///
+/// What makes the strength ease in and ease out rather than ramp straight up
+/// and straight down. Straight would still be an improvement on switching,
+/// but it has a corner at each end — the moment the assist starts and the
+/// moment it reaches full — and a corner is the thing being removed.
+fn smooth(along: f32) -> f32 {
+    let along = along.clamp(0.0, 1.0);
+    along * along * (3.0 - 2.0 * along)
 }
 
 /// What stopped the view from being steered this pass, if anything did.
@@ -289,7 +335,7 @@ mod tests {
         Steering {
             counts_per_degree: 50.0,
             gain: 0.5,
-            cap: 200,
+            cap: 200.0,
             deadzone: 0.2,
             cone: 30.0,
         }
@@ -348,18 +394,24 @@ mod tests {
         // Yaw counts anticlockwise, so a target at a higher yaw is to the
         // left, and reaching it means a negative mouse movement.
         let left = steering()
-            .counts(Offset {
-                yaw: 10.0,
-                pitch: 0.0,
-            })
+            .counts(
+                Offset {
+                    yaw: 10.0,
+                    pitch: 0.0,
+                },
+                1.0,
+            )
             .expect("a movement");
         assert!(left[0] < 0, "{left:?}");
 
         let right = steering()
-            .counts(Offset {
-                yaw: -10.0,
-                pitch: 0.0,
-            })
+            .counts(
+                Offset {
+                    yaw: -10.0,
+                    pitch: 0.0,
+                },
+                1.0,
+            )
             .expect("a movement");
         assert!(right[0] > 0, "{right:?}");
     }
@@ -369,145 +421,245 @@ mod tests {
         // Pitch counts downwards, so a target at a higher pitch is below, and
         // reaching it means a positive mouse movement.
         let below = steering()
-            .counts(Offset {
-                yaw: 0.0,
-                pitch: 10.0,
-            })
+            .counts(
+                Offset {
+                    yaw: 0.0,
+                    pitch: 10.0,
+                },
+                1.0,
+            )
             .expect("a movement");
         assert!(below[1] > 0, "{below:?}");
     }
 
-    #[test]
-    fn each_pass_covers_its_share_of_the_distance_and_leaves_the_rest() {
-        // Ten degrees at fifty counts a degree is five hundred counts to go;
-        // half of that is two hundred and fifty, which the cap trims to two
-        // hundred. Below the cap the share is exact.
-        let close = steering()
-            .counts(Offset {
-                yaw: -4.0,
-                pitch: 0.0,
-            })
-            .expect("a movement");
-        assert_eq!(close, [100, 0], "half of four degrees at fifty a degree");
+    /// The movement for one axis, at full strength.
+    fn one_pass(yaw: f32) -> i32 {
+        steering()
+            .counts(
+                Offset {
+                    yaw: -yaw,
+                    pitch: 0.0,
+                },
+                1.0,
+            )
+            .map_or(0, |movement| movement[0])
     }
 
     #[test]
-    fn no_single_pass_may_move_further_than_the_cap() {
+    fn a_movement_well_inside_the_ceiling_is_left_as_it_is() {
+        // Four tenths of a degree at fifty counts a degree, half of it: ten
+        // counts against a ceiling of two hundred. The curve has to be the
+        // identity down here, or softening the far end would quietly change
+        // how the view settles on a target at the near end.
+        assert_eq!(one_pass(0.4), 10);
+        assert_eq!(one_pass(0.8), 20);
+    }
+
+    #[test]
+    fn no_single_pass_reaches_the_ceiling_however_far_away_the_target_is() {
         // What a position read mid-write looks like: an enormous distance.
-        let wild = steering()
-            .counts(Offset {
-                yaw: -170.0,
-                pitch: 80.0,
-            })
+        assert!(one_pass(170.0) <= 200, "{}", one_pass(170.0));
+        assert!(one_pass(100_000.0) <= 200, "{}", one_pass(100_000.0));
+        // And it gets close, rather than giving up somewhere short.
+        assert!(one_pass(170.0) > 190, "{}", one_pass(170.0));
+    }
+
+    #[test]
+    fn there_is_no_distance_at_which_the_movement_stops_growing_abruptly() {
+        // A hard ceiling has a corner in it: below the corner the movement
+        // grows with the distance, above it every distance gives the same
+        // movement, and the change between the two is what is felt. Here each
+        // step in distance still buys something, and always less than the one
+        // before it — a bend, not a corner.
+        let steps: Vec<i32> = (1..=12).map(|degrees| one_pass(degrees as f32)).collect();
+        let gains: Vec<i32> = steps.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(gains.iter().all(|gain| *gain > 0), "{steps:?}");
+        assert!(
+            gains.windows(2).all(|pair| pair[1] <= pair[0]),
+            "the curve must only ever bend one way: {gains:?}"
+        );
+    }
+
+    #[test]
+    fn strength_scales_what_is_sent_without_moving_the_ceiling() {
+        let full = one_pass(4.0);
+        let half = steering()
+            .counts(
+                Offset {
+                    yaw: -4.0,
+                    pitch: 0.0,
+                },
+                0.5,
+            )
             .expect("a movement");
-        assert_eq!(wild, [200, 200]);
+        assert_eq!(half[0], (full as f32 * 0.5).round() as i32);
+
+        // At no strength there is nothing to send, however far off the view.
+        assert_eq!(
+            steering().counts(
+                Offset {
+                    yaw: -170.0,
+                    pitch: 0.0
+                },
+                0.0
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_view_already_on_target_is_left_alone_rather_than_trembling() {
         assert_eq!(
-            steering().counts(Offset {
-                yaw: 0.1,
-                pitch: 0.1
-            }),
+            steering().counts(
+                Offset {
+                    yaw: 0.1,
+                    pitch: 0.1
+                },
+                1.0
+            ),
             None,
             "inside the deadzone"
-        );
-        // And just outside it, a movement that rounding must not swallow: a
-        // third of a count is still the view not being there.
-        let tiny = Steering {
-            counts_per_degree: 1.0,
-            gain: 0.001,
-            ..steering()
-        };
-        assert_eq!(
-            tiny.counts(Offset {
-                yaw: -1.0,
-                pitch: 0.0
-            }),
-            Some([1, 0])
         );
     }
 
     #[test]
     fn a_reading_that_was_not_a_number_moves_nothing() {
         assert_eq!(
-            steering().counts(Offset {
-                yaw: f32::NAN,
-                pitch: 0.0
-            }),
+            steering().counts(
+                Offset {
+                    yaw: f32::NAN,
+                    pitch: 0.0
+                },
+                1.0
+            ),
+            None
+        );
+        assert_eq!(
+            steering().counts(
+                Offset {
+                    yaw: -10.0,
+                    pitch: 0.0
+                },
+                f32::NAN
+            ),
             None
         );
     }
 
     const PASS: Duration = Duration::from_millis(8);
 
-    fn yielding() -> Yield {
-        Yield {
+    fn ramp() -> Ramp {
+        Ramp {
             moving: 2,
-            settle: Duration::from_millis(120),
+            rise: Duration::from_millis(120),
+            fall: Duration::from_millis(120),
         }
     }
 
-    #[test]
-    fn a_hand_at_rest_leaves_the_view_to_the_assist() {
-        let mut hand = Hand::default();
-        for _ in 0..100 {
-            assert!(!hand.wins([0, 0], PASS, yielding()));
+    /// Run the ramp one way for this long, and give the strength it reaches.
+    fn ramped(grip: &mut Grip, wanted: bool, over: Duration) -> f32 {
+        let mut passed = Duration::ZERO;
+        let mut firmness = grip.firmness();
+        while passed < over {
+            firmness = grip.update(wanted, PASS, ramp());
+            passed += PASS;
         }
-        // And a movement below the threshold is still rest.
-        assert!(!hand.wins([1, -1], PASS, yielding()));
+        firmness
     }
 
     #[test]
-    fn a_hand_that_moves_takes_the_view_on_that_very_pass() {
-        let mut hand = Hand::default();
-        assert!(hand.wins([2, 0], PASS, yielding()), "sideways");
-        let mut hand = Hand::default();
-        assert!(hand.wins([0, -2], PASS, yielding()), "and vertically");
+    fn a_hand_at_rest_is_moving_on_purpose_and_one_that_barely_twitches_is_not() {
+        assert!(!ramp().moved([0, 0]));
+        assert!(!ramp().moved([1, -1]), "under the threshold either way");
+        assert!(ramp().moved([2, 0]), "sideways");
+        assert!(ramp().moved([0, -2]), "and vertically");
     }
 
     #[test]
-    fn the_assist_waits_for_the_hand_to_settle_rather_than_returning_mid_movement() {
-        let mut hand = Hand::default();
-        assert!(hand.wins([40, 0], PASS, yielding()));
+    fn a_hold_begins_with_no_grip_at_all_and_takes_the_rise_to_reach_full() {
+        // Seizing the view on the pass the button goes down is the thing that
+        // made this feel hard-edged. Every press starts from nothing.
+        let mut grip = Grip::default();
+        assert_eq!(grip.firmness(), 0.0);
 
-        // A flick arrives as packets with gaps between them. Coming back in
-        // one of those gaps would fight the second half of the movement.
-        let mut still = Duration::ZERO;
-        loop {
-            let wins = hand.wins([0, 0], PASS, yielding());
-            // Counted after the call, because what the rule weighs is the
-            // stillness including this pass — the same quantity, counted from
-            // the same moment.
-            still += PASS;
-            if still < yielding().settle {
-                assert!(wins, "came back after only {still:?}");
-            } else {
-                assert!(!wins, "still waiting after {still:?}");
-                break;
+        let part_way = ramped(&mut grip, true, ramp().rise / 2);
+        assert!(part_way > 0.0 && part_way < 1.0, "{part_way}");
+
+        let full = ramped(&mut grip, true, ramp().rise);
+        assert!(full > 0.99, "{full}");
+    }
+
+    #[test]
+    fn the_first_moments_of_a_rise_are_gentler_than_an_even_one_would_be() {
+        // What makes it a curve rather than a straight line: no corner where
+        // the assist goes from doing nothing to climbing at full rate.
+        let mut grip = Grip::default();
+        let tenth = ramp().rise / 10;
+        let early = ramped(&mut grip, true, tenth);
+        assert!(
+            early < 0.1,
+            "an even rise would be at a tenth by now: {early}"
+        );
+
+        // And the same at the top, arriving rather than striking.
+        let mut grip = Grip::default();
+        let nine_tenths = ramped(&mut grip, true, tenth * 9);
+        assert!(nine_tenths > 0.9, "{nine_tenths}");
+    }
+
+    #[test]
+    fn pushing_against_it_eases_the_grip_off_rather_than_taking_it_away() {
+        let mut grip = Grip::default();
+        assert!(ramped(&mut grip, true, ramp().rise) > 0.99);
+
+        // Partway through the fall the assist is still there, and weaker.
+        let easing = ramped(&mut grip, false, ramp().fall / 2);
+        assert!(easing > 0.0 && easing < 0.9, "{easing}");
+
+        // Keep pushing and the view is entirely the player's.
+        assert_eq!(ramped(&mut grip, false, ramp().fall), 0.0);
+    }
+
+    #[test]
+    fn the_grip_never_leaves_the_range_it_is_measured_in() {
+        let mut grip = Grip::default();
+        for wanted in [true, true, false, true, false, false, true] {
+            for _ in 0..500 {
+                let firmness = grip.update(wanted, PASS, ramp());
+                assert!((0.0..=1.0).contains(&firmness), "{firmness}");
             }
         }
     }
 
     #[test]
-    fn a_hand_moving_when_the_button_goes_down_costs_the_settle_time_and_no_more() {
+    fn the_rise_takes_the_same_time_however_often_it_is_asked() {
+        // Otherwise the feel of the assist changes with the frame rate, and
+        // a slower machine gets a different product.
+        let mut fast = Grip::default();
+        let mut slow = Grip::default();
+        let mut passed = Duration::ZERO;
+        while passed < ramp().rise {
+            fast.update(true, Duration::from_millis(2), ramp());
+            fast.update(true, Duration::from_millis(2), ramp());
+            slow.update(true, Duration::from_millis(4), ramp());
+            passed += Duration::from_millis(4);
+        }
+        assert!((fast.firmness() - slow.firmness()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_hand_moving_when_the_button_goes_down_costs_the_rise_and_no_more() {
         // The failure this replaces: deciding at the moment of the press, so
         // pressing mid-movement skipped the entire hold. Nothing here is told
         // that a hold began, which is what makes that impossible rather than
         // merely avoided.
-        let mut hand = Hand::default();
-        assert!(
-            hand.wins([30, 5], PASS, yielding()),
-            "mid-flick, button down"
-        );
+        let mut grip = Grip::default();
+        assert!(ramp().moved([30, 5]), "mid-flick, button down");
+        assert_eq!(ramped(&mut grip, false, ramp().fall), 0.0);
 
-        let mut still = Duration::ZERO;
-        while hand.wins([0, 0], PASS, yielding()) {
-            still += PASS;
-            assert!(still < Duration::from_secs(1), "never came back");
-        }
-        assert!(still <= yielding().settle + PASS, "took {still:?}");
+        // The hand settles, and the assist is all the way there one rise
+        // later — late, not absent.
+        assert!(ramped(&mut grip, true, ramp().rise) > 0.99);
     }
 
     #[test]

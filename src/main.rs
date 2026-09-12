@@ -32,7 +32,7 @@
 use std::time::{Duration, Instant};
 
 use echo::aim;
-use echo::aim::{Hand, Offset, Refusal, Steering, Yield};
+use echo::aim::{Grip, Offset, Ramp, Refusal, Steering};
 use echo::game::{Game, LocalPlayer, Player, Team, ViewAngles, ViewMatrix};
 use echo::input::{self, RawMouse};
 use echo::log::Log;
@@ -81,22 +81,29 @@ const STEERING: Steering = Steering {
     counts_per_degree: 51.0,
     gain: 0.35,
     // Five degrees a pass, which at this rate is a fast flick and not a spin.
-    // What a reading caught mid-write is allowed to cost.
-    cap: 250,
+    // What a reading caught mid-write is allowed to cost. Approached and
+    // never reached, so there is no distance at which the assist stops
+    // accelerating and starts coasting.
+    cap: 250.0,
     deadzone: 0.15,
     cone: 30.0,
 };
 
-/// When the player takes the view back.
+/// How the strength rises and falls.
 ///
-/// Both figures are first guesses, and the log records how much of every hold
-/// the hand took so they can be replaced by a reading off a real session
-/// rather than by a better guess. Two counts in a pass is around four degrees
-/// a second at the sensitivity this was measured on — under any deliberate
-/// adjustment, and above a hand at rest, which reports nothing whatsoever.
-const YIELD: Yield = Yield {
+/// Two counts in a pass is around four degrees a second at the sensitivity
+/// this was measured on — under any deliberate adjustment, and above a hand
+/// at rest, which reports nothing whatsoever.
+///
+/// The durations replace what was a plain switch. A session's tally read
+/// `hand=2853 steering=359`: the hand took three passes in four, and not
+/// because it was steering the view for three quarters of the time but
+/// because the assist was flickering on and off several times a second.
+/// Nothing about that is visible as a decision — it is felt as a hard edge.
+const RAMP: Ramp = Ramp {
     moving: 2,
-    settle: Duration::from_millis(120),
+    rise: Duration::from_millis(140),
+    fall: Duration::from_millis(120),
 };
 
 /// How far above a player's feet their eyes are, standing.
@@ -497,17 +504,17 @@ struct Aim {
     sent: [i64; 2],
     /// Sends Windows would not accept. Elevation exists to keep this at zero.
     refused: u64,
-    /// Whether the player is driving. Asked every pass, held here rather than
-    /// rebuilt, because what it knows is how long the hand has been still and
-    /// that does not belong to any one pass.
-    hand: Hand,
-    /// Passes this hold, and how many of them the hand took.
+    /// How firmly the view is held. Asked every pass, kept here rather than
+    /// rebuilt, because what it knows is where along the ramp it has got to
+    /// and that does not belong to any one pass.
+    grip: Grip,
+    /// Passes this hold, and how many of them the hand was moving through.
     ///
-    /// The share is what says whether the rule for yielding is set anywhere
-    /// near right. A hold the hand takes all of is an assist that never helps;
-    /// one it takes none of is an assist that never lets go.
+    /// The share is what says whether the ramp is set anywhere near right. A
+    /// hold the hand pushes against the whole way is an assist that never
+    /// helps; one it never pushes against is an assist that never lets go.
     passes: u32,
-    yielded: u32,
+    pushed: u32,
     /// Why nothing is happening, when nothing is happening.
     reason: Refusal,
     /// How many passes ended in each refusal, since the program started.
@@ -549,12 +556,6 @@ impl Aim {
         hand: [i64; 2],
         elapsed: Duration,
     ) {
-        // Asked first and asked unconditionally, so that what it knows is how
-        // long the hand has really been still. Asking only while the button is
-        // down would have it believe a hand that had been moving the whole
-        // time between two holds was resting.
-        let hand_wins = self.hand.wins(hand, elapsed, YIELD);
-
         let held = input::held(AIM_KEY);
         self.blocked = held && !allowed;
         let active = held && allowed;
@@ -565,15 +566,22 @@ impl Aim {
             self.target = None;
             self.offset = Offset::default();
             self.passes = 0;
-            self.yielded = 0;
+            self.pushed = 0;
         }
         self.active = active;
+
+        // Moved every pass and unconditionally, so the strength between holds
+        // decays to nothing and the next press has to earn it back. Leaving
+        // it alone while the button is up would have a second press seize the
+        // view at whatever the first one ended on.
+        let pushing = RAMP.moved(hand);
+        let grip = self.grip.update(active && !pushing, elapsed, RAMP);
         if active {
             self.passes += 1;
-            self.yielded += u32::from(hand_wins);
+            self.pushed += u32::from(pushing);
         }
 
-        let reason = match self.aim_at(active, held, me, players, angles, hand_wins) {
+        let reason = match self.aim_at(active, held, me, players, angles, grip) {
             Err(refusal) => refusal,
             Ok(counts) => {
                 if input::move_by(counts[0], counts[1]) {
@@ -610,7 +618,7 @@ impl Aim {
         me: Option<LocalPlayer>,
         players: &[Player],
         angles: ViewAngles,
-        hand_wins: bool,
+        grip: f32,
     ) -> Result<[i32; 2], Refusal> {
         if !active {
             // Returning before the target is cleared, on purpose: the line
@@ -667,10 +675,16 @@ impl Aim {
         // Last, and after the target is recorded, so the log can say which
         // enemy the view was on when the player took it back. Refusing before
         // the search would save the search and lose the reason.
-        if hand_wins {
-            return Err(Refusal::HandWins);
-        }
-        STEERING.counts(offset).ok_or(Refusal::AlreadyOnTarget)
+        STEERING.counts(offset, grip).ok_or({
+            // Nothing to send means one of two different things, and the
+            // difference is the whole point of the readout: the view is there
+            // already, or the player has taken it.
+            if offset.size() < STEERING.deadzone {
+                Refusal::AlreadyOnTarget
+            } else {
+                Refusal::HandWins
+            }
+        })
     }
 
     fn describe(&self) -> String {
@@ -686,7 +700,10 @@ impl Aim {
         if self.sent != [0; 2] {
             line += &format!("   sent {:+} {:+}", self.sent[0], self.sent[1]);
         }
-        if let Some(share) = (self.yielded * 100).checked_div(self.passes) {
+        if self.active || self.passes > 0 {
+            line += &format!("   grip {:.0}%", self.grip.firmness() * 100.0);
+        }
+        if let Some(share) = (self.pushed * 100).checked_div(self.passes) {
             line += &format!("   hand {share}% of {} passes", self.passes);
         }
         if self.refused > 0 {
