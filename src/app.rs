@@ -1,51 +1,17 @@
-//! Echo — closing the angle, once.
-//!
-//! Fire, and the view is pulled towards the nearest enemy in front of you.
-//! The moment it is anywhere inside them the pull is finished and the last of
-//! it is yours, and it stays yours until the trigger is let go and pressed
-//! again. One press, one pull. Move the mouse during it and the grip eases
-//! off; it never has to be let go of first, and it never argues.
-//!
-//! On the trigger, so the first bullet is always unhelped — the game fires on
-//! the press, and nothing outside it moves the view before that. And nothing
-//! here knows what is in the player's hands, so a grenade, a knife or a click
-//! in the buy menu pull the view exactly as a rifle does.
-//!
-//! That rule is asked again every pass, and it is never told that a hold has
-//! begun. Both matter. The product this one replaces decided at the moment of
-//! the press, so pressing while the hand was moving — which is what everyone
-//! does — skipped the entire hold; it was measured happening six times in
-//! every thirty seconds of play. Here the same press costs the settle time
-//! and nothing else.
-//!
-//! The steering is feedback, not calculation. Each pass asks where the view
-//! is, where it should be, and moves a share of the difference; the next pass
-//! asks again. So nothing has to be exactly right — the number converting
-//! degrees to mouse counts is one machine's sensitivity, and being wrong
-//! about it changes how fast the view arrives, not where.
-//!
-//! Guards, in the order they refuse: the key must be down this instant, the
-//! game must be the window in front, our own reading must be plausible, and
-//! the target must be a living enemy inside a cone around where the player is
-//! already pointing. Each refusal has its own name in the log, because a
-//! reason that is only "nothing happened" is not a reason.
-//!
-//! The check is your eyes and the log together. Point near an enemy, hold the
-//! key: the crosshair should arrive and settle without trembling. The log
-//! says which enemy and how far off, every half second, so a view that walks
-//! away instead of towards is visible as a figure that grows.
+//! Always-on aim assistance while the game is in front.
+//! Completed or timed-out pulls rearm automatically. Player, target and
+//! raw-input checks and watch mode still apply. Head aiming uses full grip.
 
 use std::time::{Duration, Instant};
 
-use crate::aim::{Grip, Offset, RAMP, Refusal, STEERING, Situation};
-use crate::game::{Game, LocalPlayer, Player, Punch, Team, ViewAngles, ViewMatrix, damage_between};
+use crate::aim::{HARD_LOCK as STEERING, Offset, RAMP, Refusal, Situation};
+use crate::game::{Game, LocalPlayer, Player, Punch, Team, ViewAngles, damage_between};
 use crate::input::{self, RawMouse};
 use crate::log::Log;
 use crate::overlay::{FrameCost, Overlay, rgb};
 use crate::process::AttachError;
 use crate::recoil::{self, Correction, Recoil};
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_LBUTTON};
 use windows::core::w;
 
 /// Target frame time. The game draws far faster than this, so a box is always
@@ -101,28 +67,6 @@ const HIT_WINDOW: Duration = Duration::from_millis(600);
 /// from its two ends, made about time instead of about angle.
 const AIM_REPORT: Duration = Duration::from_millis(500);
 const GAME_WINDOW: windows::core::PCWSTR = w!("Counter-Strike 2");
-/// Held to steer — the trigger.
-///
-/// Which makes the pull part of shooting rather than something done before
-/// it, and only works at all because the pull now ends once: an assist that
-/// held on through the trigger would be fighting the recoil the player is
-/// compensating by hand, which is the failure recorded as K1.
-///
-/// **The first bullet can never be helped.** The game fires on the press and
-/// nothing outside it can move the view before that; the pull begins after
-/// the shot has left. What it reaches is the second bullet onwards.
-///
-/// **Nothing here knows what is in the player's hands.** A grenade is thrown
-/// by releasing this button, so the pull lands in the middle of a lineup;
-/// a knife and a click in the buy menu do the same. Reading the active
-/// weapon is its own step and this wants it.
-///
-/// Read straight from the keyboard state rather than from the raw input this
-/// program already receives. The two would disagree on the frame the button
-/// goes down, and the one that matters is the one the game is acting on.
-const AIM_KEY: VIRTUAL_KEY = VK_LBUTTON;
-
-const ENEMY: COLORREF = rgb(255, 70, 70);
 const TEXT: COLORREF = rgb(235, 235, 235);
 const WARN: COLORREF = rgb(255, 190, 60);
 
@@ -216,12 +160,6 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
         // Enemies first, then teammates, then everyone else; stable within a
         // group by slot so the list does not jump around between frames.
         players.sort_by_key(|player| rank(*player, me));
-
-        // The matrix is read last, right before it is used. It is what decides
-        // where a box lands, and reading six hundred player values after it
-        // would leave it a whole pass out of date — which is a box that
-        // floats behind the enemy whenever the view swings.
-        let view = Stages::time(&mut stages.matrix, || game.view_matrix())?;
 
         // Drop an overlay whose window has gone, so the next attempt builds a
         // fresh one over the game's new window rather than drawing into a
@@ -424,9 +362,7 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
             stages.drawing = Stages::time(&mut stages.overlay, || {
                 draw_overlay(
                     overlay,
-                    view,
                     me,
-                    &players,
                     &Readouts {
                         pace,
                         hand,
@@ -484,7 +420,6 @@ fn run(log: &mut Log, watching: bool) -> Result<(), AttachError> {
 struct Stages {
     me: Duration,
     players: Duration,
-    matrix: Duration,
     overlay: Duration,
     /// Writing to the log. Measured because it is file I/O in the middle of
     /// the frame, and the one part of the loop still unaccounted for when the
@@ -547,11 +482,10 @@ impl Stages {
     /// is then measured against a frame that is too short, so they all read
     /// high, and the missing one reads as more than the whole frame. The log
     /// printed `read hand 3.183 ms 228.1%` before this was one list.
-    fn rows(self) -> [(&'static str, Duration); 12] {
+    fn rows(self) -> [(&'static str, Duration); 11] {
         [
             ("read players", self.players),
             ("draw overlay", self.overlay),
-            ("read matrix", self.matrix),
             ("read me", self.me),
             ("write log", self.log),
             ("read hand", self.hand),
@@ -693,7 +627,7 @@ struct Tick {
     hand: Option<[i64; 2]>,
 }
 
-/// Steering the view onto someone while a key is held.
+/// Steering the view automatically while the game is in front.
 ///
 /// Holds no reading of its own. Everything it decides from is passed in, so
 /// what it decides can be reasoned about from the log alone: the same inputs
@@ -712,10 +646,8 @@ struct Aim {
     sent: [i64; 2],
     /// Sends Windows would not accept. Elevation exists to keep this at zero.
     refused: u64,
-    /// How firmly the view is held. Asked every pass, kept here rather than
-    /// rebuilt, because what it knows is where along the ramp it has got to
-    /// and that does not belong to any one pass.
-    grip: Grip,
+    /// Full strength while active, zero when blocked.
+    grip: f32,
     /// How far away the target was, in world units. Kept so the offset can
     /// be read as a length on a chest rather than as an angle, which cannot
     /// be read at all without it.
@@ -727,9 +659,6 @@ struct Aim {
     /// watching run is a measurement of the same machine rather than of a
     /// different one.
     watching: bool,
-    /// Whether the button is down, regardless of whether anything may come
-    /// of it. What a press is counted from.
-    held: bool,
     /// How much of this press has been spent actually steering.
     ///
     /// Counted rather than taken from the clock, because the passes where the
@@ -797,6 +726,21 @@ impl Aim {
         (self.active, self.blocked, self.target, reason)
     }
 
+    /// Rearm automatically after each pull and when focus returns.
+    fn begin_pass(&mut self, allowed: bool) {
+        if !self.active || self.delivered_to.is_some() || self.pulled_for > STEERING.pull_limit {
+            self.sent = [0; 2];
+            self.target = None;
+            self.offset = Offset::default();
+            self.passes = 0;
+            self.pushed = 0;
+            self.delivered_to = None;
+            self.pulled_for = Duration::ZERO;
+        }
+        self.blocked = !allowed;
+        self.active = allowed;
+    }
+
     fn steer(
         &mut self,
         allowed: bool,
@@ -807,43 +751,17 @@ impl Aim {
         tick: Tick,
     ) {
         let Tick { elapsed, hand } = tick;
-        let held = input::held(AIM_KEY);
-        self.blocked = held && !allowed;
-        let active = held && allowed;
-        // Counted from the button rather than from whether the button is
-        // allowed to do anything. A single pass where the game is not the
-        // window in front — one frame of a rebuilt overlay, a blink during an
-        // alt-tab — would otherwise start the press again without it having
-        // been let go of, and hand out a second pull inside one press.
-        if held && !self.held {
-            self.sent = [0; 2];
-            self.target = None;
-            self.offset = Offset::default();
-            self.passes = 0;
-            self.pushed = 0;
-            self.delivered_to = None;
-            self.pulled_for = Duration::ZERO;
-        }
-        self.held = held;
-        self.active = active;
+        self.begin_pass(allowed);
+        let active = self.active;
 
-        // A hand nobody can read counts as a hand pushing as hard as it can.
-        // The other way round is the dangerous way: a failed registration
-        // would read as a hand at rest for the whole session, the grip would
-        // climb to full and stay there, and no amount of mouse movement would
-        // ever reduce it — the assist gripping hardest exactly when there is
-        // no way to take it back.
         let push = hand.map_or(1.0, |hand| RAMP.push(hand, elapsed));
-        // Moved every pass and unconditionally, so the strength between holds
-        // decays to nothing and the next press has to earn it back. Leaving
-        // it alone while the button is up would have a second press seize the
-        // view at whatever the first one ended on.
         self.hand_readable = hand.is_some();
-        // Delivered counts as not engaged, so the grip decays afterwards and
-        // the next press has to earn it back from nothing like any other.
-        let grip = self
-            .grip
-            .update(active && self.delivered_to.is_none(), push, elapsed, RAMP);
+        self.grip = if active && self.hand_readable {
+            1.0
+        } else {
+            0.0
+        };
+        let grip = self.grip;
         if active {
             self.passes += 1;
             // Against the push that actually costs the assist its grip. Any
@@ -855,7 +773,7 @@ impl Aim {
 
         let choice = STEERING.choose(
             &Situation {
-                held,
+                held: true,
                 in_front: allowed,
                 hand,
                 me,
@@ -873,15 +791,13 @@ impl Aim {
         // the view back still says which enemy it was taken from — except on
         // the pass the button comes up, which leaves the last hold's figures
         // standing because that is the one moment anyone wants them.
-        if held {
+        if active {
             self.target = choice.target;
             self.offset = choice.offset;
             self.distance = choice.distance;
         }
         self.just_delivered = choice.arrived && self.delivered_to.is_none();
-        // Latched, never unlatched until the next press. Asking again each
-        // pass would hand the view back the instant the target moved off it,
-        // which is the tracking this deliberately does not do.
+        // Keep delivery for hit attribution, then rearm on the next pass.
         if choice.arrived {
             self.delivered_to = self.delivered_to.or(choice.target);
         }
@@ -977,7 +893,7 @@ impl Aim {
             line += &format!("   {what} {:+} {:+}", self.sent[0], self.sent[1]);
         }
         if self.active || self.passes > 0 {
-            line += &format!("   grip {:.0}%", self.grip.firmness() * 100.0);
+            line += &format!("   grip {:.0}%", self.grip * 100.0);
         }
         if !self.hand_readable {
             line += "   no mouse to read";
@@ -1003,89 +919,25 @@ impl Aim {
     }
 }
 
-/// How tall a standing player is, in world units.
-///
-/// ponytail: one constant. Crouching makes a player shorter and this will draw
-/// a box too tall for them; read the real bounds when that starts to matter.
-const PLAYER_HEIGHT: f32 = 72.0;
-
-/// How wide a box is as a fraction of its own height on screen. Deriving the
-/// width from the height keeps the box the same shape at every distance, which
-/// a fixed pixel width would not.
-const BOX_ASPECT: f32 = 0.45;
-
-/// Draw a box around each living enemy.
-///
-/// Only enemies, only living ones, and only those the projection places in
-/// front of the camera. Every one of those is a refusal to draw rather than a
-/// guess, because a box drawn on a teammate is worse than no box at all.
+/// Draw local status only; no enemy boxes or enemy information.
 fn draw_overlay(
     overlay: &mut Overlay,
-    view: ViewMatrix,
     me: Option<LocalPlayer>,
-    players: &[Player],
     readouts: &Readouts<'_>,
 ) -> FrameCost {
     let bounds = overlay.bounds();
     overlay.frame(|canvas| {
-        // Nothing is drawn from a reading that failed its own check. Our own
-        // side is the reference every enemy test is made against, so a bad
-        // reading of it turns everyone into a target — teammates included.
         let Some(me) = me.filter(|me| me.plausible()) else {
-            canvas.text(12, 12, "readings implausible — stale offsets?", WARN);
+            canvas.text(12, 12, "readings implausible - stale offsets?", WARN);
             return;
         };
-
-        let mut drawn = 0usize;
-        let mut rejected = 0usize;
-        for player in players {
-            if !player.plausible() {
-                rejected += 1;
-                continue;
-            }
-            if !me.team.opposes(player.team) || !player.alive() {
-                continue;
-            }
-            let Some(feet) = player.origin else { continue };
-            let head = [feet[0], feet[1], feet[2] + PLAYER_HEIGHT];
-
-            // Both ends must be in front of the camera. Projecting only one
-            // and guessing the other is how a box ends up stretched across
-            // the whole screen when a player is half behind us.
-            let (Some(bottom), Some(top)) = (
-                view.project(feet, bounds.width, bounds.height),
-                view.project(head, bounds.width, bounds.height),
-            ) else {
-                continue;
-            };
-
-            let height = bottom.1 - top.1;
-            if height <= 0 {
-                continue;
-            }
-            let width = (height as f32 * BOX_ASPECT).round() as i32;
-            canvas.rect(top.0 - width / 2, top.1, width, height, ENEMY, 2);
-            drawn += 1;
-        }
-
         let mut status = vec![
-            format!("echo  {}x{}", bounds.width, bounds.height),
+            format!("echo  {}x{}  FOV 1.5 deg", bounds.width, bounds.height),
             format!("{} health {}", me.team.label(), me.health),
-            format!("{drawn} enemies on screen of {}", players.len()),
         ];
         status.extend(readouts.lines());
-
-        // Readings that failed their check are called out rather than being
-        // silently skipped: a count that climbs is what a game update looks
-        // like from here. Kept in their own list so the warning colour follows
-        // the warnings, rather than every line past a counted-out row.
-        let mut rows: Vec<(String, COLORREF)> =
-            status.into_iter().map(|line| (line, TEXT)).collect();
-        if rejected > 0 {
-            rows.push((format!("{rejected} implausible — stale offsets?"), WARN));
-        }
-        for (row, (line, colour)) in rows.iter().enumerate() {
-            canvas.text(12, 12 + row as i32 * 18, line, *colour);
+        for (row, line) in status.iter().enumerate() {
+            canvas.text(12, 12 + row as i32 * 18, line, TEXT);
         }
     })
 }
@@ -1117,7 +969,14 @@ impl Readouts<'_> {
                 ),
                 _ => "no raw mouse — the assist will not steer".to_owned(),
             },
-            self.aim.describe(),
+            format!(
+                "aim {}",
+                if self.aim.active {
+                    "active"
+                } else {
+                    "inactive"
+                }
+            ),
         ]
     }
 }
@@ -1195,6 +1054,25 @@ mod tests {
     use std::time::Duration;
 
     const PASS: Duration = Duration::from_millis(8);
+
+    #[test]
+    fn always_on_rearms_without_a_button_and_respects_focus() {
+        let mut aim = Aim::default();
+        aim.begin_pass(true);
+        assert!(aim.active);
+        assert!(!aim.blocked);
+        aim.delivered_to = Some(0x2000);
+        aim.begin_pass(true);
+        assert_eq!(aim.delivered_to, None);
+        aim.pulled_for = STEERING.pull_limit + PASS;
+        aim.begin_pass(true);
+        assert_eq!(aim.pulled_for, Duration::ZERO);
+        aim.begin_pass(false);
+        assert!(!aim.active);
+        assert!(aim.blocked);
+        aim.begin_pass(true);
+        assert!(aim.active);
+    }
 
     #[test]
     fn a_pull_is_charged_for_the_passes_it_was_live_on_and_no_others() {

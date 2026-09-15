@@ -38,11 +38,10 @@
 //! fifteen presses in three seconds, every one answered "delivered" without
 //! moving anything, every one a degree and a bit off.
 //!
-//! Nothing in here switches on or off. Every edge is a curve, in both of the
-//! places an edge would otherwise be felt. A movement asked for approaches
+//! A movement asked for approaches
 //! its ceiling instead of striking it, so there is no distance at which the
 //! assist stops accelerating and starts coasting. And the strength it steers
-//! with rises and falls over time rather than between two passes, so pushing
+//! with rises and falls linearly over time, so pushing
 //! against it meets a grip that eases off rather than one that lets go.
 
 use std::time::Duration;
@@ -340,6 +339,18 @@ pub const STEERING: Steering = Steering {
     cone: 30.0,
 };
 
+/// Head aiming at 70% gain used by the always-on application.
+/// ponytail: fixed standing head height; read head bones for crouching and animation.
+pub const HARD_LOCK: Steering = Steering {
+    cone: 1.5,
+    gain: 0.7,
+    aim_height: 64.0,
+    engage_beyond: 0.0,
+    settle_within: 0.0,
+    deadzone: 0.03,
+    ..STEERING
+};
+
 /// How the strength rises and falls.
 ///
 /// A speed, and not a number of counts in a pass, because counts in a pass
@@ -363,8 +374,8 @@ pub const RAMP: Ramp = Ramp {
     // gap and gave up. Thirty-four seconds of play held the view for less
     // than one of them.
     //
-    // A pass covers a fifth of this, so the ease-in is five passes and the
-    // curve is still a curve — but only just. Shortening it further would
+    // A pass covers a fifth of this, so the linear rise is five passes.
+    // Shortening it further would
     // meet the clamp that stops one pass crossing a whole ramp, and quietly
     // become the switch this replaced.
     rise: Duration::from_millis(40),
@@ -457,11 +468,7 @@ impl Ramp {
 /// impossible rather than merely avoided.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Grip {
-    /// How far along the ramp, before the curve is applied.
-    ///
-    /// Kept separately from the strength it produces so that the curve is
-    /// applied to the position and not compounded into it each pass, which
-    /// would make the rise depend on how often it was asked.
+    /// Linear grip strength along the ramp, clamped to zero through one.
     along: f32,
 }
 
@@ -502,7 +509,7 @@ impl Grip {
         self.along +=
             Self::step(elapsed, ramp.rise) * (1.0 - push) - Self::step(elapsed, ramp.fall) * push;
         self.along = self.along.clamp(0.0, 1.0);
-        smooth(self.along)
+        self.along
     }
 
     /// The share of a ramp one pass of this length covers.
@@ -516,19 +523,8 @@ impl Grip {
 
     /// How firm it is, without moving it. For anything that only reports.
     pub fn firmness(self) -> f32 {
-        smooth(self.along)
+        self.along
     }
-}
-
-/// The curve that leaves both ends flat.
-///
-/// What makes the strength ease in and ease out rather than ramp straight up
-/// and straight down. Straight would still be an improvement on switching,
-/// but it has a corner at each end — the moment the assist starts and the
-/// moment it reaches full — and a corner is the thing being removed.
-fn smooth(along: f32) -> f32 {
-    let along = along.clamp(0.0, 1.0);
-    along * along * (3.0 - 2.0 * along)
 }
 
 /// Everything one pass knows, as plain values.
@@ -962,6 +958,39 @@ mod tests {
     use super::*;
     use crate::game::Team;
 
+    #[test]
+    fn hard_lock_only_selects_targets_within_one_and_a_half_degrees() {
+        let players = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
+        let mut now = situation(&players);
+        for yaw in [-1.5, 1.5] {
+            now.aimed.yaw = yaw;
+            assert_eq!(
+                HARD_LOCK.choose(&now, ramp(), 1.0, 0.0).target,
+                Some(0x2000)
+            );
+        }
+        for (pitch, yaw) in [(0.0, -1.51), (0.0, 1.51), (1.1, 1.1)] {
+            now.aimed = angles(pitch, yaw);
+            let choice = HARD_LOCK.choose(&now, ramp(), 1.0, 0.0);
+            assert_eq!(choice.target, None);
+            assert_eq!(choice.counts, Err(Refusal::NoEnemyInTheCone));
+        }
+    }
+
+    #[test]
+    fn hard_lock_targets_head_height_and_corrects_small_errors_at_full_push() {
+        let players = facing_east(&[enemy(0x2000, [1000.0, 0.0, 0.0])]);
+        let mut now = situation(&players);
+        let centered = HARD_LOCK.choose(&now, ramp(), 1.0, 1.0);
+        assert!(centered.arrived);
+        assert_eq!(centered.offset.pitch, 0.0);
+        now.aimed.yaw = 0.2;
+        let correction = HARD_LOCK.choose(&now, ramp(), 1.0, 1.0);
+        assert!(!correction.arrived);
+        assert!(correction.counts.is_ok());
+        assert_eq!(HARD_LOCK.aim_point([0.0; 3]), [0.0, 0.0, 64.0]);
+    }
+
     fn angles(pitch: f32, yaw: f32) -> ViewAngles {
         ViewAngles { pitch, yaw }
     }
@@ -1304,21 +1333,18 @@ mod tests {
     }
 
     #[test]
-    fn the_first_moments_of_a_rise_are_gentler_than_an_even_one_would_be() {
-        // What makes it a curve rather than a straight line: no corner where
-        // the assist goes from doing nothing to climbing at full rate.
+    fn grip_rises_and_falls_linearly_without_an_s_curve() {
         let mut grip = Grip::default();
-        let tenth = ramp().rise / 10;
-        let early = ramped(&mut grip, true, 0.0, tenth);
-        assert!(
-            early < 0.1,
-            "an even rise would be at a tenth by now: {early}"
-        );
-
-        // And the same at the top, arriving rather than striking.
-        let mut grip = Grip::default();
-        let nine_tenths = ramped(&mut grip, true, 0.0, tenth * 9);
-        assert!(nine_tenths > 0.9, "{nine_tenths}");
+        for expected in [0.25, 0.5, 0.75, 1.0] {
+            let actual = grip.update(true, 0.0, ramp().rise / 4, ramp());
+            assert!((actual - expected).abs() < 1e-6);
+            assert_eq!(grip.firmness(), actual);
+        }
+        for expected in [0.75, 0.5, 0.25, 0.0] {
+            let actual = grip.update(false, 0.0, ramp().fall / 4, ramp());
+            assert!((actual - expected).abs() < 1e-6);
+            assert_eq!(grip.firmness(), actual);
+        }
     }
 
     #[test]
