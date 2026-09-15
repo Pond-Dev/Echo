@@ -8,6 +8,21 @@ pub const DEADZONE: f32 = 0.03;
 // Calibration for the player's mouse sensitivity.
 pub const COUNTS_PER_DEGREE: f32 = 51.0;
 const CAP: f32 = 60.0;
+pub const CROSSHAIR_WEIGHT: f32 = 0.5;
+pub const SWITCH_MARGIN: f32 = 0.05;
+const DISTANCE_SCALE: f32 = 1000.0;
+
+pub fn distance(eye: [f32; 3], head: [f32; 3]) -> f32 {
+    (head[0] - eye[0])
+        .hypot(head[1] - eye[1])
+        .hypot(head[2] - eye[2])
+}
+
+/// Lower is better. Distance is bounded so it cannot overwhelm crosshair proximity.
+pub fn score(at: Offset, distance: f32) -> f32 {
+    CROSSHAIR_WEIGHT * at.size() / CONE
+        + (1.0 - CROSSHAIR_WEIGHT) * (distance / (distance + DISTANCE_SCALE))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Offset {
@@ -44,6 +59,8 @@ pub fn offset(view: ViewAngles, desired: ViewAngles) -> Offset {
 pub struct Choice {
     pub pawn: usize,
     pub offset: Offset,
+    pub distance: f32,
+    pub score: f32,
     pub counts: [i32; 2],
 }
 
@@ -68,20 +85,35 @@ pub fn choose(
         .and_then(|p| p.eye)
         .filter(|eye| eye.iter().all(|v| v.is_finite()))
         .ok_or("missing-eye")?;
-    let (pawn, at) = players
+    let mut choice = players
         .iter()
         .filter(|p| p.pawn != me.pawn && p.plausible() && p.alive() && me.team.opposes(p.team))
         .filter_map(|p| {
-            let at = offset(view, look_at(eye, p.head?)?);
-            (at.size() <= CONE).then_some((p.pawn, at))
+            let head = p.head?;
+            let at = offset(view, look_at(eye, head)?);
+            let distance = distance(eye, head);
+            (at.size() <= CONE && distance.is_finite()).then_some(Choice {
+                pawn: p.pawn,
+                offset: at,
+                distance,
+                score: score(at, distance),
+                counts: [0, 0],
+            })
         })
-        .min_by(|(a_pawn, a), (b_pawn, b)| {
-            (Some(*b_pawn) == locked)
-                .cmp(&(Some(*a_pawn) == locked))
-                .then_with(|| a.size().total_cmp(&b.size()))
+        .min_by(|a, b| {
+            // A small advantage is not enough to take the current target away.
+            let a_locked = Some(a.pawn) == locked;
+            let b_locked = Some(b.pawn) == locked;
+            let a_score = a.score - if a_locked { SWITCH_MARGIN } else { 0.0 };
+            let b_score = b.score - if b_locked { SWITCH_MARGIN } else { 0.0 };
+            a_score
+                .total_cmp(&b_score)
+                .then_with(|| b_locked.cmp(&a_locked))
+                .then_with(|| a.pawn.cmp(&b.pawn))
         })
         .ok_or("no-head-in-cone")?;
-    let counts = if at.size() <= DEADZONE {
+    let at = choice.offset;
+    choice.counts = if at.size() <= DEADZONE {
         [0, 0]
     } else {
         let scale = COUNTS_PER_DEGREE * GAIN;
@@ -91,11 +123,7 @@ pub fn choose(
         ]
         .map(|v| (CAP * v).round() as i32)
     };
-    Ok(Choice {
-        pawn,
-        offset: at,
-        counts,
-    })
+    Ok(choice)
 }
 
 #[cfg(test)]
@@ -154,18 +182,57 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_same_head_until_it_leaves_the_cone_or_dies() {
+    fn switches_to_a_better_crosshair_target_and_replaces_invalid_owners() {
         let (me, mut players, view) = scene();
         players.push(Player {
             pawn: 3,
             ..players[1]
         });
         players[1].head = Some([1000.0, 20.0, 46.0]);
-        assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 2);
+        assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
         players[1].head = Some([1000.0, 30.0, 46.0]);
         assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
         players[1].head = Some([1000.0, 0.0, 46.0]);
         players[1].health = 0;
+        assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
+    }
+
+    #[test]
+    fn equally_weighted_distance_can_win_with_a_slightly_worse_crosshair_angle() {
+        let (me, mut players, view) = scene();
+        players[1].head = Some([3000.0, 0.0, 46.0]);
+        players.push(Player {
+            pawn: 3,
+            head: Some([500.0, 4.0, 46.0]),
+            ..players[1]
+        });
+        let choice = choose(Some(me), &players, view, Some(2)).unwrap();
+        assert_eq!(choice.pawn, 3);
+        assert!(choice.distance < 501.0);
+        assert!(choice.offset.size() > 0.4);
+
+        // A nearby head still cannot be selected outside the cone.
+        players[2].head = Some([500.0, 20.0, 46.0]);
+        assert_eq!(choose(Some(me), &players, view, Some(3)).unwrap().pawn, 2);
+    }
+
+    #[test]
+    fn small_score_changes_keep_the_lock_regardless_of_roster_order() {
+        let (me, mut players, view) = scene();
+        players[1].head = Some([1000.0, 10.0, 46.0]);
+        players.push(Player {
+            pawn: 3,
+            head: Some([1000.0, 9.0, 46.0]),
+            ..players[1]
+        });
+        assert_eq!(choose(Some(me), &players, view, None).unwrap().pawn, 3);
+        assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 2);
+        players.swap(1, 2);
+        assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 2);
+        assert_eq!(choose(Some(me), &players, view, Some(3)).unwrap().pawn, 3);
+
+        // Once the challenger is clearly better, it can take over.
+        players[1].head = Some([1000.0, 0.0, 46.0]);
         assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
     }
 

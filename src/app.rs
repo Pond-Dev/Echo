@@ -30,9 +30,10 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         return Ok(());
     }
     log.record(&format!(
-        "diagnostics=head-only-v4 pid={} cone={} gain={} deadzone={} head_index={} bone_array_offset=0x{:X}",
+        "diagnostics=dynamic-head-v5 pid={} cone={} gain={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
         game.pid(), aim::CONE, aim::GAIN, aim::DEADZONE,
         crate::game::offsets::scene_node::HEAD, crate::game::offsets::scene_node::BONE_ARRAY,
+        aim::CROSSHAIR_WEIGHT, aim::SWITCH_MARGIN,
     ));
     let mut locked = None;
     let mut last_state = None;
@@ -49,6 +50,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         };
         let mut reason = choice.as_ref().err().copied().unwrap_or("locked");
         let mut sent = [0, 0];
+        let previous = locked;
         locked = choice.as_ref().ok().map(|choice| choice.pawn);
         if let Ok(choice) = &choice {
             if input::move_by(game.pid(), choice.counts[0], choice.counts[1]) {
@@ -62,9 +64,11 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         let due = started >= next_report;
         if last_state != Some(state) || due {
             log.record(&format!(
-                "aim-head reason={reason} target={} view={view:?} offset={:?} sent={sent:?}",
+                "aim-head reason={reason} target={} previous={previous:?} view={view:?} offset={:?} distance={:?} score={:?} sent={sent:?}",
                 locked.map_or_else(|| "none".to_owned(), |pawn| format!("0x{pawn:X}")),
                 choice.as_ref().ok().map(|choice| choice.offset),
+                choice.as_ref().ok().map(|choice| choice.distance),
+                choice.as_ref().ok().map(|choice| choice.score),
             ));
             last_state = Some(state);
         }
@@ -104,6 +108,12 @@ fn lock_geometry(me: Option<LocalPlayer>, players: &[Player], view: ViewAngles) 
             .zip(player.head)
             .and_then(|(eye, head)| crate::aim::look_at(eye, head))
             .map(|desired| crate::aim::offset(view, desired));
+        let distance = eye
+            .zip(player.head)
+            .map(|(eye, head)| aim::distance(eye, head));
+        let score = at
+            .zip(distance)
+            .map(|(at, distance)| aim::score(at, distance));
         let status = if !player.plausible() {
             "invalid-health"
         } else if !player.alive() {
@@ -120,7 +130,7 @@ fn lock_geometry(me: Option<LocalPlayer>, players: &[Player], view: ViewAngles) 
             "eligible"
         };
         lines.push(format!(
-            "lock-candidate pawn=0x{:X} health={} origin={:?} head={:?} off_deg={:?} offset={at:?} status={status}",
+            "lock-candidate pawn=0x{:X} health={} origin={:?} head={:?} off_deg={:?} offset={at:?} distance={distance:?} score={score:?} status={status}",
             player.pawn, player.health, player.origin, player.head, at.map(|at| at.size()),
         ));
     }
