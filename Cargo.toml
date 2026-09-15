@@ -7,20 +7,11 @@ edition = "2024"
 name = "echo"
 path = "src/lib.rs"
 
-# A thin shell over the library. `test = false` because the binary carries the
-# elevation manifest, and a test harness built from it cannot be launched.
+# Only the executable carries the elevation manifest.
 [[bin]]
 name = "echo"
 path = "src/main.rs"
 test = false
 
-# The same program with nothing wired to the mouse. A separate executable
-# rather than a flag, because a control nobody can be bothered to run is not
-# a control.
-[[bin]]
-name = "echo-watch"
-path = "src/bin/echo-watch.rs"
-test = false
-
 [dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Devices_HumanInterfaceDevice"] }
+windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

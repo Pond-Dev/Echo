@@ -42,9 +42,6 @@ pub mod module {
     /// Pointer to the entity system, which owns the chunk table every other
     /// entity is reached through.
     pub const ENTITY_SYSTEM: usize = client_dll::dwEntityList;
-
-    /// The 4x4 matrix the game renders with: sixteen `f32` in a row.
-    pub const VIEW_MATRIX: usize = client_dll::dwViewMatrix;
 }
 
 /// Field positions inside an entity, relative to the entity's own address.
@@ -65,30 +62,7 @@ pub mod entity {
 pub mod pawn {
     use super::schemas;
 
-    /// Pointer to the object holding what the gun has done to the aim.
-    ///
-    /// The aim punch, not the view punch. Two things called a punch exist and
-    /// they are not the same: one is where the shot goes and the other is
-    /// where the camera is thrown, and compensating for the second would
-    /// leave the bullets where they were.
-    pub const AIM_PUNCH_SERVICES: usize = schemas::C_CSPlayerPawn::m_pAimPunchServices;
-
-    /// Rounds fired without letting go of the trigger. `i32`, back to nought
-    /// on release.
-    pub const SHOTS_FIRED: usize = schemas::C_CSPlayerPawn::m_iShotsFired;
-}
-
-/// Field positions inside the aim punch object.
-pub mod aim_punch {
-    use super::schemas;
-
-    /// How far the gun has thrown the aim, as three `f32` — pitch, yaw, roll.
-    ///
-    /// The game keeps this as a base taken at a tick plus a velocity, and
-    /// what is read here is the base. Whether that is close enough to the
-    /// punch as it stands is a question for a log, which is why the first
-    /// thing built on it only writes it down.
-    pub const ANGLE: usize = schemas::CCSPlayer_AimPunchServices::m_predictableBaseAngle;
+    pub const VIEW_OFFSET: usize = schemas::C_BaseModelEntity::m_vecViewOffset;
 }
 
 /// Field positions inside a player controller — the persistent object for a
@@ -103,6 +77,12 @@ pub mod controller {
 /// Field positions inside a scene node.
 pub mod scene_node {
     use super::schemas;
+
+    // Engine-internal CModelState layout; recheck after game updates.
+    pub const BONE_ARRAY: usize = schemas::CSkeletonInstance::m_modelState + 0x80;
+    pub const BONE_STRIDE: usize = 0x20;
+    // ponytail: standard player rig; resolve by model name for custom rigs.
+    pub const HEAD: usize = 6;
 
     /// Position in the world: three `f32`.
     pub const ORIGIN: usize = schemas::CGameSceneNode::m_vecAbsOrigin;

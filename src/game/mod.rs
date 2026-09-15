@@ -5,11 +5,8 @@
 
 use crate::process::{AttachError, Module, Process};
 
-pub use projection::ViewMatrix;
-
 pub mod entities;
 pub mod offsets;
-pub mod projection;
 
 const EXE: &str = "cs2.exe";
 const CLIENT_MODULE: &str = "client.dll";
@@ -41,11 +38,6 @@ impl Game {
         self.process.pid()
     }
 
-    /// Reads made since this was last called, and reset.
-    pub fn take_reads(&self) -> u64 {
-        self.process.take_reads()
-    }
-
     /// Confirm `client.dll` really is a loaded PE image. Cheap sanity check
     /// that separates "attached to the wrong thing" from "offset is stale".
     pub fn client_looks_like_a_module(&self) -> windows::core::Result<bool> {
@@ -65,22 +57,6 @@ impl Game {
             pitch: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             yaw: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         })
-    }
-
-    /// The matrix the game is currently rendering with.
-    ///
-    /// Read in one go rather than field by field: the game rewrites it every
-    /// frame, and sixteen separate reads could straddle a write and mix two
-    /// matrices into one that projects to nowhere real.
-    pub fn view_matrix(&self) -> windows::core::Result<ViewMatrix> {
-        let mut bytes = [0u8; 64];
-        self.process
-            .read(self.client.base + offsets::module::VIEW_MATRIX, &mut bytes)?;
-        let mut values = [0f32; 16];
-        for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(4)) {
-            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        Ok(ViewMatrix::from_raw(values))
     }
 
     /// The local player, when there is one.
@@ -103,43 +79,6 @@ impl Game {
 
         let team = Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?);
         Ok(Some(LocalPlayer { pawn, health, team }))
-    }
-
-    /// What the gun has done to the aim, and how many rounds are behind it.
-    ///
-    /// Two readings rather than one because they answer different questions
-    /// and only make sense together: the punch says how far off the shot will
-    /// be, and the count says whether the trigger has been held since the
-    /// last time anyone looked.
-    ///
-    /// `None` for the same reasons following any pointer into a pawn gives
-    /// none — the round ended, the player died, the object moved between the
-    /// two reads. Ordinary, and not a fault.
-    pub fn aim_punch(&self, pawn: usize) -> windows::core::Result<Option<(Punch, i32)>> {
-        let Some(services) = self
-            .process
-            .read_pointer(pawn + offsets::pawn::AIM_PUNCH_SERVICES)?
-        else {
-            return Ok(None);
-        };
-        let mut bytes = [0u8; 8];
-        if self
-            .process
-            .read(services + offsets::aim_punch::ANGLE, &mut bytes)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let Ok(shots) = self.process.read_i32(pawn + offsets::pawn::SHOTS_FIRED) else {
-            return Ok(None);
-        };
-        Ok(Some((
-            Punch {
-                pitch: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                yaw: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            },
-            shots,
-        )))
     }
 
     /// Every connected player the game will tell us about.
@@ -200,12 +139,24 @@ impl Game {
             return Ok(None);
         };
 
+        let origin = self.origin_of(pawn)?;
+        let eye = origin.and_then(|origin| {
+            let view = self.vector_at(pawn + offsets::pawn::VIEW_OFFSET).ok()?;
+            (view[0].abs() <= 16.0 && view[1].abs() <= 16.0 && (16.0..=80.0).contains(&view[2]))
+                .then_some([
+                    origin[0] + view[0],
+                    origin[1] + view[1],
+                    origin[2] + view[2],
+                ])
+        });
+        let head = origin.and_then(|origin| self.head_of(pawn, origin));
         Ok(Some(Player {
-            controller,
             pawn,
             health: self.process.read_i32(pawn + offsets::entity::HEALTH)?,
             team: Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?),
-            origin: self.origin_of(pawn)?,
+            origin,
+            eye,
+            head,
         }))
     }
 
@@ -222,15 +173,80 @@ impl Game {
         else {
             return Ok(None);
         };
+        self.vector_at(node + offsets::scene_node::ORIGIN).map(Some)
+    }
+
+    fn head_of(&self, pawn: usize, origin: [f32; 3]) -> Option<[f32; 3]> {
+        let node = self
+            .process
+            .read_pointer(pawn + offsets::entity::SCENE_NODE)
+            .ok()??;
+        let address = node + offsets::scene_node::BONE_ARRAY;
+        let bones = self.process.read_pointer(address).ok()??;
+        let head = self
+            .vector_at(bones + offsets::scene_node::HEAD * offsets::scene_node::BONE_STRIDE)
+            .ok()?;
+        // Do not accept a transform from an array replaced during the read.
+        if self.process.read_pointer(address).ok()? != Some(bones) {
+            return None;
+        }
+        valid_head(origin, head).then_some(head)
+    }
+
+    fn vector_at(&self, address: usize) -> windows::core::Result<[f32; 3]> {
         let mut bytes = [0u8; 12];
-        self.process
-            .read(node + offsets::scene_node::ORIGIN, &mut bytes)?;
-        Ok(Some([
+        self.process.read(address, &mut bytes)?;
+        Ok([
             f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-        ]))
+        ])
     }
+
+    /// A separate, low-rate probe. These are fresh reads, not the steering snapshot.
+    pub fn geometry_probe(&self, pawn: usize) -> String {
+        let view = self.vector_at(pawn + offsets::pawn::VIEW_OFFSET);
+        let mut line = format!("bone-probe pawn=0x{pawn:X} view_offset_raw={view:?}");
+        let mut probe = || -> Result<(), String> {
+            let node = self
+                .process
+                .read_pointer(pawn + offsets::entity::SCENE_NODE)
+                .map_err(|e| format!("scene-node-read:{e}"))?
+                .ok_or("scene-node-null")?;
+            line += &format!(" node=0x{node:X}");
+            let origin = self
+                .vector_at(node + offsets::scene_node::ORIGIN)
+                .map_err(|e| format!("origin-read:{e}"))?;
+            line += &format!(" origin_raw={origin:?}");
+            let address = node + offsets::scene_node::BONE_ARRAY;
+            let bones = self
+                .process
+                .read_pointer(address)
+                .map_err(|e| format!("bone-array-read:{e}"))?
+                .ok_or("bone-array-null")?;
+            line += &format!(" bones=0x{bones:X}");
+            let head = self
+                .vector_at(bones + offsets::scene_node::HEAD * offsets::scene_node::BONE_STRIDE)
+                .map_err(|e| format!("head-read:{e}"))?;
+            line += &format!(" head_raw={head:?} head_valid={}", valid_head(origin, head));
+            let after = self
+                .process
+                .read_pointer(address)
+                .map_err(|e| format!("bone-array-recheck:{e}"))?;
+            line += &format!(" array_stable={}", after == Some(bones));
+            Ok(())
+        };
+        if let Err(error) = probe() {
+            line += &format!(" error={error}");
+        }
+        line
+    }
+}
+
+fn valid_head(origin: [f32; 3], head: [f32; 3]) -> bool {
+    origin.iter().chain(head.iter()).all(|v| v.is_finite())
+        && (head[0] - origin[0]).hypot(head[1] - origin[1]) <= 64.0
+        && (16.0..=96.0).contains(&(head[2] - origin[2]))
 }
 
 /// Which side an entity plays for.
@@ -273,29 +289,21 @@ impl Team {
             (Self::Terrorist, Self::CounterTerrorist) | (Self::CounterTerrorist, Self::Terrorist)
         )
     }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Unassigned => "none",
-            Self::Spectator => "spec",
-            Self::Terrorist => "T",
-            Self::CounterTerrorist => "CT",
-            Self::Unknown(_) => "?",
-        }
-    }
 }
 
 /// One connected player, as of this pass.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Player {
-    /// The persistent object for this player.
-    pub controller: usize,
     /// The body they are currently driving. Changes on every respawn.
     pub pawn: usize,
     pub health: i32,
     pub team: Team,
     /// `None` when the scene node could not be reached this pass.
     pub origin: Option<[f32; 3]>,
+    /// Current camera position, including crouch view offset.
+    pub eye: Option<[f32; 3]>,
+    /// Current world-space head bone; absent on a failed or invalid read.
+    pub head: Option<[f32; 3]>,
 }
 
 impl Player {
@@ -308,94 +316,6 @@ impl Player {
     pub const fn plausible(self) -> bool {
         0 <= self.health && self.health <= 100
     }
-}
-
-/// How far the gun has thrown the aim away from where the view is pointing.
-///
-/// Degrees, as the engine stores them: pitch positive downwards. A gun
-/// kicking upwards therefore reads as pitch going negative.
-///
-/// This is not part of the view angle. The view angle is where the player
-/// pointed; the punch is what the weapon added on top, and where a shot
-/// actually goes is the two together. Which is why compensating means moving
-/// the view by the opposite of it, and why a log of the view angle alone
-/// during a spray looks perfectly steady while the bullets climb.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Punch {
-    pub pitch: f32,
-    pub yaw: f32,
-}
-
-impl Punch {
-    /// Whether this could be a real punch at all.
-    ///
-    /// No weapon in the game throws the aim further than this. A reading
-    /// outside it is a pointer that led somewhere else, which is what a stale
-    /// offset looks like from here.
-    pub fn plausible(self) -> bool {
-        self.pitch.is_finite()
-            && self.yaw.is_finite()
-            && self.pitch.abs() <= 45.0
-            && self.yaw.abs() <= 45.0
-    }
-
-    pub fn size(self) -> f32 {
-        self.pitch.hypot(self.yaw)
-    }
-}
-
-/// Health somebody lost between two readings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Damage {
-    pub pawn: usize,
-    pub team: Team,
-    pub from: i32,
-    pub to: i32,
-}
-
-impl Damage {
-    pub const fn amount(self) -> i32 {
-        self.from - self.to
-    }
-
-    pub const fn fatal(self) -> bool {
-        self.to == 0
-    }
-}
-
-/// Who lost health between two readings of the same players.
-///
-/// The only measurement in the program that is about what the product is for
-/// rather than about how it runs. Everything else — degrees off, how firm the
-/// grip was, how many passes it took — is a stand-in for this, and stand-ins
-/// were agreeing that things were going well through a session in which the
-/// shots were landing on an arm.
-///
-/// Only falls count. A reading that climbs is somebody healing or, far more
-/// often, a pawn that has been reused for a player who respawned; either way
-/// nobody was shot.
-///
-/// And both readings have to be of somebody real. Plausible health is not
-/// enough on its own: a slot that has been freed and zeroed reads as health
-/// nought, which is inside the plausible range and is also exactly what being
-/// killed looks like, so it would write a fatal hit for a player nobody shot.
-/// A zeroed slot's team reads as unassigned, and nobody unassigned is playing
-/// — which is the tell, and the only one there is.
-pub fn damage_between(before: &[Player], now: &[Player]) -> Vec<Damage> {
-    now.iter()
-        .filter(|player| player.plausible() && player.team.plays())
-        .filter_map(|player| {
-            let was = before.iter().find(|earlier| {
-                earlier.pawn == player.pawn && earlier.plausible() && earlier.team.plays()
-            })?;
-            (player.health < was.health).then_some(Damage {
-                pawn: player.pawn,
-                team: player.team,
-                from: was.health,
-                to: player.health,
-            })
-        })
-        .collect()
 }
 
 /// Pitch and yaw in degrees, as the engine stores them.
@@ -466,107 +386,22 @@ impl LocalPlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Damage, LocalPlayer, Player, Punch, Team, ViewAngles, damage_between};
+    use super::{LocalPlayer, Team, ViewAngles};
 
     #[test]
-    fn a_punch_no_weapon_could_produce_is_not_a_punch() {
-        assert!(
-            Punch {
-                pitch: -6.0,
-                yaw: 1.5
-            }
-            .plausible()
-        );
-        assert!(Punch::default().plausible(), "nothing fired yet");
-        for wrong in [
-            Punch {
-                pitch: f32::NAN,
-                yaw: 0.0,
-            },
-            Punch {
-                pitch: 0.0,
-                yaw: f32::INFINITY,
-            },
-            Punch {
-                pitch: -900.0,
-                yaw: 0.0,
-            },
-            Punch {
-                pitch: 0.0,
-                yaw: 120.0,
-            },
+    fn head_geometry_rejects_zero_stale_and_nonfinite_transforms() {
+        let origin = [100.0, 200.0, 10.0];
+        assert!(super::valid_head(origin, [105.0, 202.0, 58.0]));
+        assert!(super::valid_head(origin, [100.0, 200.0, 74.0]));
+        for invalid in [
+            [0.0; 3],
+            origin,
+            [1000.0, 200.0, 74.0],
+            [100.0, 200.0, 1000.0],
+            [f32::NAN, 200.0, 74.0],
         ] {
-            assert!(!wrong.plausible(), "{wrong:?}");
+            assert!(!super::valid_head(origin, invalid));
         }
-    }
-
-    fn standing(pawn: usize, health: i32) -> Player {
-        Player {
-            controller: pawn,
-            pawn,
-            team: Team::Terrorist,
-            health,
-            origin: Some([0.0; 3]),
-        }
-    }
-
-    #[test]
-    fn losing_health_is_reported_and_gaining_it_is_not() {
-        let before = [standing(1, 100), standing(2, 40)];
-        let now = [standing(1, 73), standing(2, 100)];
-        assert_eq!(
-            damage_between(&before, &now),
-            vec![Damage {
-                pawn: 1,
-                team: Team::Terrorist,
-                from: 100,
-                to: 73
-            }]
-        );
-    }
-
-    #[test]
-    fn a_pawn_nobody_had_seen_before_is_not_somebody_who_lost_health() {
-        // Which matters here more than it sounds: a pawn is reused when a
-        // player respawns, so somebody arriving in the table at less than
-        // full health is ordinary rather than a hit.
-        assert_eq!(damage_between(&[], &[standing(1, 40)]), vec![]);
-        assert_eq!(damage_between(&[standing(1, 40)], &[]), vec![]);
-    }
-
-    #[test]
-    fn a_freed_slot_reading_zero_is_not_somebody_who_was_just_killed() {
-        // The most common shape of rubbish, and the one that looks most like
-        // a real event: a pawn released and its memory zeroed reads health
-        // nought, which is inside the plausible range and is what a death
-        // looks like. Its team reads unassigned, and nobody unassigned plays.
-        let freed = Player {
-            team: Team::Unassigned,
-            ..standing(1, 0)
-        };
-        assert_eq!(damage_between(&[standing(1, 100)], &[freed]), vec![]);
-        assert_eq!(damage_between(&[freed], &[standing(1, 40)]), vec![]);
-    }
-
-    #[test]
-    fn a_reading_that_could_not_be_real_does_not_become_a_hit() {
-        // A pointer gone stale reads rubbish, and rubbish that happens to be
-        // smaller than the last real number would otherwise look like damage.
-        let before = [standing(1, 100)];
-        assert_eq!(damage_between(&before, &[standing(1, -5000)]), vec![]);
-        assert_eq!(
-            damage_between(&[standing(1, 9000)], &[standing(1, 50)]),
-            vec![]
-        );
-    }
-
-    #[test]
-    fn reaching_zero_is_the_last_of_it() {
-        let dead = damage_between(&[standing(1, 18)], &[standing(1, 0)]);
-        assert_eq!(dead.len(), 1);
-        assert_eq!(dead[0].amount(), 18);
-        assert!(dead[0].fatal());
-        assert!(!damage_between(&[standing(1, 100)], &[standing(1, 73)])[0].fatal());
     }
 
     fn facing(yaw: f32) -> ViewAngles {
