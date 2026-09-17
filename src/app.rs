@@ -1,9 +1,10 @@
 //! Always-on head AimLock while CS2 owns the foreground window.
 
 use crate::aim;
+use crate::aim::Offset;
 use crate::game::{Game, LocalPlayer, Player, ViewAngles};
 use crate::input;
-use crate::log::Log;
+use crate::log::{Log, num, pawn, point};
 use crate::process::AttachError;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         return Ok(());
     }
     log.record(&format!(
-        "diagnostics=dynamic-head-v5 pid={} cone={} gain={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
+        "diagnostics=head-capsule-v7 pid={} cone={} gain={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
         game.pid(), aim::CONE, aim::GAIN, aim::DEADZONE,
         crate::game::offsets::scene_node::HEAD, crate::game::offsets::scene_node::BONE_ARRAY,
         aim::CROSSHAIR_WEIGHT, aim::SWITCH_MARGIN,
@@ -63,12 +64,22 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         let state = (locked, reason);
         let due = started >= next_report;
         if last_state != Some(state) || due {
+            let choice = choice.as_ref().ok();
             log.record(&format!(
-                "aim-head reason={reason} target={} previous={previous:?} view={view:?} offset={:?} distance={:?} score={:?} sent={sent:?}",
-                locked.map_or_else(|| "none".to_owned(), |pawn| format!("0x{pawn:X}")),
-                choice.as_ref().ok().map(|choice| choice.offset),
-                choice.as_ref().ok().map(|choice| choice.distance),
-                choice.as_ref().ok().map(|choice| choice.score),
+                "aim-head reason={reason} target={} previous={} view=[{:.2},{:.2}] off={} aim_z={} dist={} score={} sent=[{},{}]",
+                pawn(locked),
+                pawn(previous),
+                view.pitch,
+                view.yaw,
+                choice.map_or_else(
+                    || "-".to_owned(),
+                    |choice| format!("[{:.2},{:.2}]", choice.offset.yaw, choice.offset.pitch),
+                ),
+                num(choice.and_then(|choice| choice.aim_above_origin), 1),
+                num(choice.map(|choice| choice.distance), 1),
+                num(choice.map(|choice| choice.score), 3),
+                sent[0],
+                sent[1],
             ));
             last_state = Some(state);
         }
@@ -95,9 +106,10 @@ fn lock_geometry(me: Option<LocalPlayer>, players: &[Player], view: ViewAngles) 
     let local = me.and_then(|me| players.iter().find(|p| p.pawn == me.pawn));
     let eye = local.and_then(|p| p.eye);
     let mut lines = vec![format!(
-        "lock-local me={me:?} in_roster={} origin={:?} eye={eye:?} players={}",
+        "lock-local me={me:?} in_roster={} origin={} eye={} players={}",
         local.is_some(),
-        local.and_then(|p| p.origin),
+        point(local.and_then(|p| p.origin)),
+        point(eye),
         players.len(),
     )];
     for player in players
@@ -130,8 +142,24 @@ fn lock_geometry(me: Option<LocalPlayer>, players: &[Player], view: ViewAngles) 
             "eligible"
         };
         lines.push(format!(
-            "lock-candidate pawn=0x{:X} health={} origin={:?} head={:?} off_deg={:?} offset={at:?} distance={distance:?} score={score:?} status={status}",
-            player.pawn, player.health, player.origin, player.head, at.map(|at| at.size()),
+            "lock-candidate pawn=0x{:X} health={} aim_z={} head={} off_deg={} off={} dist={} score={} status={status}",
+            player.pawn,
+            player.health,
+            num(
+                player
+                    .origin
+                    .zip(player.head)
+                    .map(|(origin, head)| head[2] - origin[2]),
+                1,
+            ),
+            point(player.head),
+            num(at.map(Offset::size), 2),
+            at.map_or_else(
+                || "-".to_owned(),
+                |at| format!("[{:.2},{:.2}]", at.yaw, at.pitch),
+            ),
+            num(distance, 1),
+            num(score, 3),
         ));
     }
     lines

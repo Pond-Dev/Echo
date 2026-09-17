@@ -19,6 +19,28 @@ use std::time::Instant;
 
 const FILE_NAME: &str = "echo.log";
 
+/// One number, or a dash when there was nothing to measure.
+///
+/// The log is read by eye, and `Some(0.29089355)` spends most of its width
+/// saying `0.29`. Every reading here is a measurement of a running game, so
+/// the digits past the second are noise from the read, not precision.
+pub fn num(value: Option<f32>, places: usize) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.places$}"))
+}
+
+pub fn point(value: Option<[f32; 3]>) -> String {
+    value.map_or_else(
+        || "-".to_owned(),
+        |[x, y, z]| format!("[{x:.1},{y:.1},{z:.1}]"),
+    )
+}
+
+/// Pawns are addresses. Printing one in decimal and its neighbour in hex is
+/// how a log hides that they are the same player.
+pub fn pawn(value: Option<usize>) -> String {
+    value.map_or_else(|| "none".to_owned(), |pawn| format!("0x{pawn:X}"))
+}
+
 pub struct Log {
     /// Buffered, because this is written from the middle of the frame loop
     /// and an unbuffered file is one write into the kernel per line. A report
@@ -91,6 +113,22 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::Log;
+
+    #[test]
+    fn a_missing_reading_prints_as_a_dash_rather_than_a_plausible_number() {
+        // A dash cannot be mistaken for a measurement, and the fields stay
+        // greppable when half a roster has no geometry.
+        assert_eq!(super::num(None, 1), "-");
+        assert_eq!(super::point(None), "-");
+        assert_eq!(super::pawn(None), "none");
+        assert_eq!(super::num(Some(0.29089355), 2), "0.29");
+        assert_eq!(super::num(Some(-3.8153), 1), "-3.8");
+        assert_eq!(
+            super::point(Some([-144.0, -1568.0, -11.96875])),
+            "[-144.0,-1568.0,-12.0]"
+        );
+        assert_eq!(super::pawn(Some(0x51A5AA24000)), "0x51A5AA24000");
+    }
 
     #[test]
     fn a_log_that_could_not_be_opened_reports_no_path_and_still_accepts_writes() {

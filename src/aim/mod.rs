@@ -61,6 +61,10 @@ pub struct Choice {
     pub offset: Offset,
     pub distance: f32,
     pub score: f32,
+    /// How far up the target the aim point sits, from its own feet. This is
+    /// the one number that says head or body: a standing player's eyes are at
+    /// 64, so anything well under that is the neck and chest.
+    pub aim_above_origin: Option<f32>,
     pub counts: [i32; 2],
 }
 
@@ -97,6 +101,7 @@ pub fn choose(
                 offset: at,
                 distance,
                 score: score(at, distance),
+                aim_above_origin: p.origin.map(|origin| head[2] - origin[2]),
                 counts: [0, 0],
             })
         })

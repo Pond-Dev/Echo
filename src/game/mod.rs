@@ -176,21 +176,48 @@ impl Game {
         self.vector_at(node + offsets::scene_node::ORIGIN).map(Some)
     }
 
+    /// The point to aim at: the centre of the head capsule, accepted only when
+    /// the whole capsule lands where a head can be.
     fn head_of(&self, pawn: usize, origin: [f32; 3]) -> Option<[f32; 3]> {
         let node = self
             .process
             .read_pointer(pawn + offsets::entity::SCENE_NODE)
             .ok()??;
+        let capsule = self.stable_head_capsule(node).ok()??;
+        let centre = std::array::from_fn(|axis| (capsule[0][axis] + capsule[1][axis]) * 0.5);
+        capsule
+            .iter()
+            .chain(std::iter::once(&centre))
+            .all(|point| valid_head(origin, *point))
+            .then_some(centre)
+    }
+
+    /// Three attempts, each thrown away unless the bone array is the same one
+    /// before and after the read. The array is replaced while the game poses
+    /// the skeleton, and a transform torn across that swap is not a pose any
+    /// player ever had. It is worth another attempt, and worth none at all
+    /// rather than aiming at it.
+    fn stable_head_capsule(&self, node: usize) -> windows::core::Result<Option<[[f32; 3]; 2]>> {
         let address = node + offsets::scene_node::BONE_ARRAY;
-        let bones = self.process.read_pointer(address).ok()??;
-        let head = self
-            .vector_at(bones + offsets::scene_node::HEAD * offsets::scene_node::BONE_STRIDE)
-            .ok()?;
-        // Do not accept a transform from an array replaced during the read.
-        if self.process.read_pointer(address).ok()? != Some(bones) {
-            return None;
+        for _ in 0..3 {
+            let Some(bones) = self.process.read_pointer(address)? else {
+                continue;
+            };
+            let capsule = self.head_capsule_at(bones)?;
+            if capsule.is_some() && self.process.read_pointer(address)? == Some(bones) {
+                return Ok(capsule);
+            }
         }
-        valid_head(origin, head).then_some(head)
+        Ok(None)
+    }
+
+    fn head_capsule_at(&self, bones: usize) -> windows::core::Result<Option<[[f32; 3]; 2]>> {
+        let mut bytes = [0u8; offsets::scene_node::BONE_STRIDE];
+        self.process.read(
+            bones + offsets::scene_node::HEAD * offsets::scene_node::BONE_STRIDE,
+            &mut bytes,
+        )?;
+        Ok(head_capsule(bytes))
     }
 
     fn vector_at(&self, address: usize) -> windows::core::Result<[f32; 3]> {
@@ -204,9 +231,19 @@ impl Game {
     }
 
     /// A separate, low-rate probe. These are fresh reads, not the steering snapshot.
+    ///
+    /// `eye_z` and `above_origin` are the pair worth reading: the capsule's
+    /// two heights up the player against the height of that player's own
+    /// eyes. Both ends well under the eyes means [`offsets::scene_node::HEAD`]
+    /// is not naming the head, whatever the rest of the line says.
     pub fn geometry_probe(&self, pawn: usize) -> String {
-        let view = self.vector_at(pawn + offsets::pawn::VIEW_OFFSET);
-        let mut line = format!("bone-probe pawn=0x{pawn:X} view_offset_raw={view:?}");
+        let eye_z = self
+            .vector_at(pawn + offsets::pawn::VIEW_OFFSET)
+            .map(|view| view[2]);
+        let mut line = format!(
+            "bone-probe pawn=0x{pawn:X} eye_z={}",
+            crate::log::num(eye_z.ok(), 2)
+        );
         let mut probe = || -> Result<(), String> {
             let node = self
                 .process
@@ -217,7 +254,7 @@ impl Game {
             let origin = self
                 .vector_at(node + offsets::scene_node::ORIGIN)
                 .map_err(|e| format!("origin-read:{e}"))?;
-            line += &format!(" origin_raw={origin:?}");
+            line += &format!(" origin={}", crate::log::point(Some(origin)));
             let address = node + offsets::scene_node::BONE_ARRAY;
             let bones = self
                 .process
@@ -225,10 +262,17 @@ impl Game {
                 .map_err(|e| format!("bone-array-read:{e}"))?
                 .ok_or("bone-array-null")?;
             line += &format!(" bones=0x{bones:X}");
-            let head = self
-                .vector_at(bones + offsets::scene_node::HEAD * offsets::scene_node::BONE_STRIDE)
+            let capsule = self
+                .head_capsule_at(bones)
                 .map_err(|e| format!("head-read:{e}"))?;
-            line += &format!(" head_raw={head:?} head_valid={}", valid_head(origin, head));
+            line += &format!(
+                " head=[{},{}] above_origin=[{},{}] head_valid={}",
+                crate::log::point(capsule.map(|capsule| capsule[0])),
+                crate::log::point(capsule.map(|capsule| capsule[1])),
+                crate::log::num(capsule.map(|capsule| capsule[0][2] - origin[2]), 1),
+                crate::log::num(capsule.map(|capsule| capsule[1][2] - origin[2]), 1),
+                capsule.is_some_and(|capsule| capsule.iter().all(|p| valid_head(origin, *p)))
+            );
             let after = self
                 .process
                 .read_pointer(address)
@@ -241,6 +285,39 @@ impl Game {
         }
         line
     }
+}
+
+/// One bone transform: translation, uniform scale, then an XYZW quaternion.
+///
+/// Both capsule endpoints are carried through the bone's own rotation. A
+/// fixed offset along world Z would be right only while the head is upright,
+/// and a head is never upright at the moment somebody is worth shooting.
+fn head_capsule(bytes: [u8; 32]) -> Option<[[f32; 3]; 2]> {
+    let f: [f32; 8] =
+        std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+    // The gate is on the magnitude, the vector keeps the sign: a rig is
+    // allowed to mirror a bone, and rejecting that loses a real head.
+    if !f.iter().all(|v| v.is_finite()) || !(0.01..=100.0).contains(&f[3].abs()) {
+        return None;
+    }
+    let norm = f[4..].iter().map(|v| v * v).sum::<f32>();
+    if !(0.81..=1.21).contains(&norm) {
+        return None;
+    }
+    let [x, y, z, w] = [f[4], f[5], f[6], f[7]].map(|v| v / norm.sqrt());
+    Some(offsets::scene_node::HEAD_CAPSULE.map(|local| {
+        let [vx, vy, vz] = local.map(|v| v * f[3]);
+        let [tx, ty, tz] = [
+            2.0 * (y * vz - z * vy),
+            2.0 * (z * vx - x * vz),
+            2.0 * (x * vy - y * vx),
+        ];
+        [
+            f[0] + vx + w * tx + y * tz - z * ty,
+            f[1] + vy + w * ty + z * tx - x * tz,
+            f[2] + vz + w * tz + x * ty - y * tx,
+        ]
+    }))
 }
 
 fn valid_head(origin: [f32; 3], head: [f32; 3]) -> bool {
@@ -302,7 +379,7 @@ pub struct Player {
     pub origin: Option<[f32; 3]>,
     /// Current camera position, including crouch view offset.
     pub eye: Option<[f32; 3]>,
-    /// Current world-space head bone; absent on a failed or invalid read.
+    /// Current world-space head hitbox center; absent on a failed or invalid read.
     pub head: Option<[f32; 3]>,
 }
 
@@ -387,6 +464,56 @@ impl LocalPlayer {
 #[cfg(test)]
 mod tests {
     use super::{LocalPlayer, Team, ViewAngles};
+
+    #[test]
+    fn head_capsule_center_follows_rotation_and_rejects_bad_transforms() {
+        // Installed player DATA skeleton starts with root_motion; index 6 is neck.
+        let names = [
+            "root_motion",
+            "pelvis",
+            "spine_0",
+            "spine_1",
+            "spine_2",
+            "spine_3",
+            "neck_0",
+            "head_0",
+        ];
+        assert_eq!(names[super::offsets::scene_node::HEAD], "head_0");
+        let encode = |f: [f32; 8]| -> [u8; 32] {
+            let mut bytes = [0; 32];
+            for (out, value) in bytes.chunks_exact_mut(4).zip(f) {
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        };
+        let centre = |bytes| {
+            super::head_capsule(bytes)
+                .map(|c: [[f32; 3]; 2]| std::array::from_fn(|i| (c[0][i] + c[1][i]) * 0.5))
+        };
+        assert_eq!(
+            super::head_capsule(encode([10.0, 20.0, 60.0, 1.0, 0.0, 0.0, 0.0, 1.0])),
+            Some([[9.0, 21.8, 60.0], [13.5, 20.2, 60.0]])
+        );
+        assert_eq!(
+            centre(encode([10.0, 20.0, 60.0, 1.0, 0.0, 0.0, 0.0, 1.0])),
+            Some([11.25, 21.0, 60.0])
+        );
+        // A 90-degree turn around Y sends local +X toward world -Z.
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        let rotated: [f32; 3] = centre(encode([10.0, 20.0, 60.0, 2.0, 0.0, q, 0.0, q])).unwrap();
+        for (actual, expected) in rotated.into_iter().zip([10.0, 22.0, 57.5]) {
+            assert!((actual - expected).abs() < 0.0001, "got {rotated:?}");
+        }
+        // A mirrored bone is a pose, not a bad read: the sign drives the
+        // vector while the magnitude alone decides plausibility.
+        assert_eq!(
+            centre(encode([10.0, 20.0, 60.0, -1.0, 0.0, 0.0, 0.0, 1.0])),
+            Some([8.75, 19.0, 60.0])
+        );
+        assert!(super::head_capsule([0; 32]).is_none());
+        assert!(super::head_capsule(encode([f32::NAN; 8])).is_none());
+        assert!(super::head_capsule(encode([0.0, 0.0, 60.0, 1.0, 0.0, 0.0, 0.0, 2.0])).is_none());
+    }
 
     #[test]
     fn head_geometry_rejects_zero_stale_and_nonfinite_transforms() {

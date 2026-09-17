@@ -82,7 +82,13 @@ pub mod scene_node {
     pub const BONE_ARRAY: usize = schemas::CSkeletonInstance::m_modelState + 0x80;
     pub const BONE_STRIDE: usize = 0x20;
     // ponytail: standard player rig; resolve by model name for custom rigs.
-    pub const HEAD: usize = 6;
+    // Installed agents/models rigs: 6 = neck_0, 7 = head_0.
+    pub const HEAD: usize = 7;
+    /// The `head_0` capsule of the `cstrike` hitbox set, in bone-local space.
+    /// Both endpoints are kept rather than a precomputed midpoint: the probe
+    /// logs them, and two points falling where a head is, is the evidence that
+    /// [`HEAD`] names the head bone at all.
+    pub const HEAD_CAPSULE: [[f32; 3]; 2] = [[-1.0, 1.8, 0.0], [3.5, 0.2, 0.0]];
 
     /// Position in the world: three `f32`.
     pub const ORIGIN: usize = schemas::CGameSceneNode::m_vecAbsOrigin;
