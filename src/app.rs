@@ -31,16 +31,20 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         return Ok(());
     }
     log.record(&format!(
-        "diagnostics=head-capsule-v7 pid={} cone={} gain={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
-        game.pid(), aim::CONE, aim::GAIN, aim::DEADZONE,
+        "diagnostics=head-ease-v8 pid={} cone={} response_ms={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
+        game.pid(), aim::CONE, aim::RESPONSE_MS, aim::DEADZONE,
         crate::game::offsets::scene_node::HEAD, crate::game::offsets::scene_node::BONE_ARRAY,
         aim::CROSSHAIR_WEIGHT, aim::SWITCH_MARGIN,
     ));
     let mut locked = None;
+    let mut motion = aim::Motion::default();
     let mut last_state = None;
     let mut next_report = Instant::now();
+    let mut last_tick = next_report - FRAME;
     loop {
         let started = Instant::now();
+        let elapsed = started.duration_since(last_tick);
+        last_tick = started;
         let me = game.local_player()?;
         let players = game.players()?;
         let view = game.view_angles()?;
@@ -53,12 +57,14 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
         let mut sent = [0, 0];
         let previous = locked;
         locked = choice.as_ref().ok().map(|choice| choice.pawn);
-        if let Ok(choice) = &choice {
-            if input::move_by(game.pid(), choice.counts[0], choice.counts[1]) {
-                sent = choice.counts;
+        let counts = motion.step(choice.as_ref().ok(), elapsed);
+        if choice.is_ok() {
+            if input::move_by(game.pid(), counts[0], counts[1]) {
+                sent = counts;
             } else {
                 reason = "input-blocked";
                 locked = None;
+                motion = aim::Motion::default();
             }
         }
         let state = (locked, reason);

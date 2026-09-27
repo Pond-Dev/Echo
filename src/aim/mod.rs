@@ -1,13 +1,14 @@
 //! Head AimLock: current camera to current head bone.
 
 use crate::game::{LocalPlayer, Player, ViewAngles};
+use std::time::Duration;
 
-pub const CONE: f32 = 1.5;
-pub const GAIN: f32 = 0.7;
+pub const CONE: f32 = 3.0;
+pub const RESPONSE_MS: f32 = 35.0;
 pub const DEADZONE: f32 = 0.03;
 // Calibration for the player's mouse sensitivity.
 pub const COUNTS_PER_DEGREE: f32 = 51.0;
-const CAP: f32 = 60.0;
+const MAX_COUNTS_PER_SECOND: f32 = 2500.0;
 pub const CROSSHAIR_WEIGHT: f32 = 0.5;
 pub const SWITCH_MARGIN: f32 = 0.05;
 const DISTANCE_SCALE: f32 = 1000.0;
@@ -65,7 +66,52 @@ pub struct Choice {
     /// the one number that says head or body: a standing player's eyes are at
     /// 64, so anything well under that is the neck and chest.
     pub aim_above_origin: Option<f32>,
-    pub counts: [i32; 2],
+}
+
+/// Ease toward the current head; retain sub-count movement near the centre.
+#[derive(Default)]
+pub struct Motion {
+    pawn: Option<usize>,
+    remainder: [f32; 2],
+}
+
+impl Motion {
+    pub fn step(&mut self, choice: Option<&Choice>, elapsed: Duration) -> [i32; 2] {
+        let Some(choice) =
+            choice.filter(|c| c.offset.size().is_finite() && c.offset.size() <= CONE)
+        else {
+            *self = Self::default();
+            return [0, 0];
+        };
+        // Never replay a long scheduler pause as one large movement.
+        let mut dt = elapsed.as_secs_f32().min(0.016);
+        if self.pawn != Some(choice.pawn) {
+            self.pawn = Some(choice.pawn);
+            self.remainder = [0.0; 2];
+            dt = dt.min(0.008);
+        }
+        if choice.offset.size() <= DEADZONE {
+            self.remainder = [0.0; 2];
+            return [0, 0];
+        }
+        if dt == 0.0 {
+            return [0, 0];
+        }
+        let gain = -(-dt / (RESPONSE_MS / 1000.0)).exp_m1();
+        let distance = choice.offset.size() * COUNTS_PER_DEGREE * gain;
+        let cap = MAX_COUNTS_PER_SECOND * dt;
+        let scale = COUNTS_PER_DEGREE * gain * (cap * (distance / cap).tanh() / distance);
+        let delta = [-choice.offset.yaw * scale, choice.offset.pitch * scale];
+        std::array::from_fn(|axis| {
+            if delta[axis].signum() != self.remainder[axis].signum() {
+                self.remainder[axis] = 0.0;
+            }
+            let total = delta[axis] + self.remainder[axis];
+            let count = total.trunc() as i32;
+            self.remainder[axis] = total - count as f32;
+            count
+        })
+    }
 }
 
 pub fn choose(
@@ -89,7 +135,7 @@ pub fn choose(
         .and_then(|p| p.eye)
         .filter(|eye| eye.iter().all(|v| v.is_finite()))
         .ok_or("missing-eye")?;
-    let mut choice = players
+    players
         .iter()
         .filter(|p| p.pawn != me.pawn && p.plausible() && p.alive() && me.team.opposes(p.team))
         .filter_map(|p| {
@@ -102,7 +148,6 @@ pub fn choose(
                 distance,
                 score: score(at, distance),
                 aim_above_origin: p.origin.map(|origin| head[2] - origin[2]),
-                counts: [0, 0],
             })
         })
         .min_by(|a, b| {
@@ -116,19 +161,7 @@ pub fn choose(
                 .then_with(|| b_locked.cmp(&a_locked))
                 .then_with(|| a.pawn.cmp(&b.pawn))
         })
-        .ok_or("no-head-in-cone")?;
-    let at = choice.offset;
-    choice.counts = if at.size() <= DEADZONE {
-        [0, 0]
-    } else {
-        let scale = COUNTS_PER_DEGREE * GAIN;
-        [
-            (-at.yaw * scale / CAP).tanh(),
-            (at.pitch * scale / CAP).tanh(),
-        ]
-        .map(|v| (CAP * v).round() as i32)
-    };
-    Ok(choice)
+        .ok_or("no-head-in-cone")
 }
 
 #[cfg(test)]
@@ -171,19 +204,126 @@ mod tests {
     fn crouched_head_is_measured_from_the_current_camera_only() {
         let (me, mut players, mut view) = scene();
         assert_eq!(
-            choose(Some(me), &players, view, None).unwrap().counts,
-            [0, 0]
+            choose(Some(me), &players, view, None)
+                .unwrap()
+                .offset
+                .size(),
+            0.0
         );
         view.pitch = -0.67;
         let choice = choose(Some(me), &players, view, None).unwrap();
         assert!((choice.offset.pitch - 0.67).abs() < 0.001);
-        assert!(choice.counts[1] > 0);
         players[1].head = Some([1000.0, 10.0, 48.0]);
         view = look_at(players[0].eye.unwrap(), players[1].head.unwrap()).unwrap();
         assert_eq!(
-            choose(Some(me), &players, view, None).unwrap().counts,
-            [0, 0]
+            choose(Some(me), &players, view, None)
+                .unwrap()
+                .offset
+                .size(),
+            0.0
         );
+    }
+
+    #[test]
+    fn eased_motion_settles_on_the_head_and_keeps_tracking_at_different_tick_rates() {
+        for millis in [8, 16] {
+            let dt = Duration::from_millis(millis);
+            let (me, mut players, mut view) = scene();
+            view.yaw = -1.2;
+            view.pitch = -0.5;
+            let mut motion = Motion::default();
+            let choice = choose(Some(me), &players, view, None).unwrap();
+            let first = motion.step(Some(&choice), dt);
+            assert!(first[0] < 0 && first[1] > 0);
+            assert!(first[0].abs() <= 15, "acquisition should ease in");
+            view.yaw -= first[0] as f32 / COUNTS_PER_DEGREE;
+            view.pitch += first[1] as f32 / COUNTS_PER_DEGREE;
+            for _ in 0..240 / millis {
+                let choice = choose(Some(me), &players, view, Some(2)).unwrap();
+                let before = choice.offset.size();
+                let counts = motion.step(Some(&choice), dt);
+                view.yaw -= counts[0] as f32 / COUNTS_PER_DEGREE;
+                view.pitch += counts[1] as f32 / COUNTS_PER_DEGREE;
+                let after = choose(Some(me), &players, view, Some(2)).unwrap();
+                assert!(after.offset.size() <= before + 0.001);
+            }
+            let settled = choose(Some(me), &players, view, Some(2)).unwrap();
+            assert!(settled.offset.size() <= DEADZONE);
+            assert_eq!(motion.step(Some(&settled), dt), [0, 0]);
+
+            // A moving head must remain selected while the softer output follows it.
+            for tick in 1..=1000 / millis {
+                let angle = (8.0 * tick as f32 * dt.as_secs_f32()).to_radians();
+                players[1].head = Some([1000.0 * angle.cos(), 1000.0 * angle.sin(), 46.0]);
+                let choice = choose(Some(me), &players, view, Some(2)).unwrap();
+                assert_eq!(choice.pawn, 2);
+                assert!(choice.offset.size() < 0.5);
+                let counts = motion.step(Some(&choice), dt);
+                view.yaw -= counts[0] as f32 / COUNTS_PER_DEGREE;
+                view.pitch += counts[1] as f32 / COUNTS_PER_DEGREE;
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_motion_reaches_the_deadzone_and_resets_on_loss_or_switch() {
+        let (me, players, mut view) = scene();
+        view.yaw = -0.031;
+        let choice = choose(Some(me), &players, view, None).unwrap();
+        let dt = Duration::from_millis(8);
+        let mut motion = Motion::default();
+        assert_eq!(motion.step(Some(&choice), dt), [0, 0]);
+        assert_eq!(motion.step(Some(&choice), dt), [0, 0]);
+        assert_eq!(motion.step(Some(&choice), dt), [0, 0]);
+        assert_eq!(motion.step(Some(&choice), dt), [-1, 0]);
+        // A partial count from the old target must not move a new/reacquired one.
+        motion.step(Some(&choice), dt);
+        motion.step(Some(&choice), dt);
+        assert_eq!(motion.step(None, dt), [0, 0]);
+        assert_eq!(motion.step(Some(&choice), dt), [0, 0]);
+        motion.step(Some(&choice), dt);
+        motion.step(Some(&choice), dt);
+        let switched = Choice { pawn: 3, ..choice };
+        assert_eq!(motion.step(Some(&switched), dt), [0, 0]);
+        let reversed = Choice {
+            offset: Offset {
+                yaw: -1.0,
+                pitch: -0.5,
+            },
+            ..switched
+        };
+        let counts = motion.step(Some(&reversed), dt);
+        assert!(counts[0] > 0 && counts[1] < 0);
+        let centred = Choice {
+            offset: Offset::default(),
+            ..reversed
+        };
+        assert_eq!(motion.step(Some(&centred), dt), [0, 0]);
+        assert_eq!(motion.remainder, [0.0; 2]);
+    }
+
+    #[test]
+    fn motion_drops_invalid_geometry_and_bounds_output_after_a_pause() {
+        let (me, players, mut view) = scene();
+        view.yaw = -CONE;
+        let choice = choose(Some(me), &players, view, None).unwrap();
+        let mut motion = Motion::default();
+        motion.step(Some(&choice), Duration::from_millis(8));
+        let counts = motion.step(Some(&choice), Duration::from_secs(2));
+        assert!(counts[0] < 0 && counts[0].abs() <= 40);
+        assert_eq!(motion.step(Some(&choice), Duration::ZERO), [0, 0]);
+        for yaw in [f32::NAN, f32::INFINITY, CONE + 0.1] {
+            let invalid = Choice {
+                offset: Offset { yaw, pitch: 0.0 },
+                ..choice
+            };
+            assert_eq!(
+                motion.step(Some(&invalid), Duration::from_millis(8)),
+                [0, 0]
+            );
+            assert_eq!(motion.pawn, None);
+            assert_eq!(motion.remainder, [0.0; 2]);
+        }
     }
 
     #[test]
@@ -193,9 +333,9 @@ mod tests {
             pawn: 3,
             ..players[1]
         });
-        players[1].head = Some([1000.0, 20.0, 46.0]);
+        players[1].head = Some([1000.0, 1000.0 * (CONE * 0.6).to_radians().tan(), 46.0]);
         assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
-        players[1].head = Some([1000.0, 30.0, 46.0]);
+        players[1].head = Some([1000.0, 1000.0 * (CONE + 0.1).to_radians().tan(), 46.0]);
         assert_eq!(choose(Some(me), &players, view, Some(2)).unwrap().pawn, 3);
         players[1].head = Some([1000.0, 0.0, 46.0]);
         players[1].health = 0;
@@ -217,17 +357,17 @@ mod tests {
         assert!(choice.offset.size() > 0.4);
 
         // A nearby head still cannot be selected outside the cone.
-        players[2].head = Some([500.0, 20.0, 46.0]);
+        players[2].head = Some([500.0, 500.0 * (CONE + 0.1).to_radians().tan(), 46.0]);
         assert_eq!(choose(Some(me), &players, view, Some(3)).unwrap().pawn, 2);
     }
 
     #[test]
     fn small_score_changes_keep_the_lock_regardless_of_roster_order() {
         let (me, mut players, view) = scene();
-        players[1].head = Some([1000.0, 10.0, 46.0]);
+        players[1].head = Some([1000.0, 1000.0 * (CONE * 0.4).to_radians().tan(), 46.0]);
         players.push(Player {
             pawn: 3,
-            head: Some([1000.0, 9.0, 46.0]),
+            head: Some([1000.0, 1000.0 * (CONE * 0.38).to_radians().tan(), 46.0]),
             ..players[1]
         });
         assert_eq!(choose(Some(me), &players, view, None).unwrap().pawn, 3);
