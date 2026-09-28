@@ -63,6 +63,17 @@ pub mod pawn {
     use super::schemas;
 
     pub const VIEW_OFFSET: usize = schemas::C_BaseModelEntity::m_vecViewOffset;
+    pub const WEAPON_SERVICES: usize = schemas::C_BasePlayerPawn::m_pWeaponServices;
+}
+
+/// The active weapon handle and its embedded economy item definition.
+pub mod weapon {
+    use super::schemas;
+
+    pub const ACTIVE_HANDLE: usize = schemas::CPlayer_WeaponServices::m_hActiveWeapon;
+    pub const ITEM_DEFINITION: usize = schemas::C_EconEntity::m_AttributeManager
+        + schemas::C_AttributeContainer::m_Item
+        + schemas::C_EconItemView::m_iItemDefinitionIndex;
 }
 
 /// Field positions inside a player controller — the persistent object for a

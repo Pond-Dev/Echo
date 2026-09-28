@@ -78,7 +78,35 @@ impl Game {
         };
 
         let team = Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?);
-        Ok(Some(LocalPlayer { pawn, health, team }))
+        Ok(Some(LocalPlayer {
+            pawn,
+            health,
+            team,
+            weapon: self.active_weapon_definition(pawn),
+        }))
+    }
+
+    /// Re-read the held weapon each tick; missing or unreadable data disables aim.
+    fn active_weapon_definition(&self, pawn: usize) -> Option<u16> {
+        let services = self
+            .process
+            .read_pointer(pawn + offsets::pawn::WEAPON_SERVICES)
+            .ok()??;
+        let handle = self
+            .process
+            .read_u32(services + offsets::weapon::ACTIVE_HANDLE)
+            .ok()?;
+        let index = entities::handle_index(handle)?;
+        let system = self
+            .process
+            .read_pointer(self.client.base + offsets::module::ENTITY_SYSTEM)
+            .ok()??;
+        let weapon = self.entity(system, index).ok()??;
+        let mut bytes = [0u8; 2];
+        self.process
+            .read(weapon + offsets::weapon::ITEM_DEFINITION, &mut bytes)
+            .ok()?;
+        Some(u16::from_le_bytes(bytes))
     }
 
     /// Every connected player the game will tell us about.
@@ -444,6 +472,8 @@ pub struct LocalPlayer {
     pub health: i32,
     /// Which side we are on — the reference every enemy check is made against.
     pub team: Team,
+    /// Item definition of the held weapon, or None when it cannot be read.
+    pub weapon: Option<u16>,
 }
 
 impl LocalPlayer {
@@ -458,6 +488,14 @@ impl LocalPlayer {
 
     pub const fn alive(self) -> bool {
         self.health > 0
+    }
+
+    /// Known guns and Zeus only; knives, grenades, C4 and unknown items stay idle.
+    pub const fn has_aim_weapon(self) -> bool {
+        matches!(
+            self.weapon,
+            Some(1..=4 | 7..=11 | 13..=14 | 16..=17 | 19 | 23..=36 | 38..=40 | 60..=61 | 63..=64)
+        )
     }
 }
 
@@ -564,6 +602,7 @@ mod tests {
             pawn: 0x1234_5678,
             health,
             team: Team::CounterTerrorist,
+            weapon: Some(7),
         }
     }
 

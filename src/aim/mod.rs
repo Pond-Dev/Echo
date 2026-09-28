@@ -126,6 +126,9 @@ pub fn choose(
     if !me.alive() {
         return Err("not-alive");
     }
+    if !me.has_aim_weapon() {
+        return Err("weapon-disabled");
+    }
     if !view.plausible() {
         return Err("invalid-view");
     }
@@ -174,6 +177,7 @@ mod tests {
             pawn: 1,
             health: 100,
             team: Team::Terrorist,
+            weapon: Some(7),
         };
         let player = Player {
             pawn: 1,
@@ -198,6 +202,55 @@ mod tests {
                 yaw: 0.0,
             },
         )
+    }
+
+    #[test]
+    fn switching_to_knives_grenades_or_missing_weapons_clears_lock_and_motion() {
+        let (me, players, mut view) = scene();
+        view.yaw = -0.031;
+        let dt = Duration::from_millis(8);
+        let choice = choose(Some(me), &players, view, None).unwrap();
+        let disabled = [0, 59, 68, 69, 70, 75, 76, 78, 80, u16::MAX]
+            .into_iter()
+            .chain(41..=49)
+            .chain(81..=85)
+            .chain(500..=526)
+            .map(Some)
+            .chain(std::iter::once(None));
+        for weapon in disabled {
+            let mut motion = Motion::default();
+            motion.step(Some(&choice), dt);
+            motion.step(Some(&choice), dt);
+            motion.step(Some(&choice), dt);
+            assert!(motion.remainder[0] != 0.0);
+            for locked in [None, Some(choice.pawn)] {
+                let blocked = choose(Some(LocalPlayer { weapon, ..me }), &players, view, locked);
+                assert_eq!(
+                    blocked.as_ref().err(),
+                    Some(&"weapon-disabled"),
+                    "{weapon:?}"
+                );
+                assert_eq!(motion.step(blocked.as_ref().ok(), dt), [0, 0]);
+                assert_eq!(motion.pawn, None);
+                assert_eq!(motion.remainder, [0.0; 2]);
+            }
+            // Returning to a gun acquires normally without replaying old counts.
+            let resumed = choose(Some(me), &players, view, None).unwrap();
+            assert_eq!(motion.step(Some(&resumed), dt), [0, 0]);
+        }
+        for weapon in [
+            1, 2, 3, 4, 7, 8, 9, 10, 11, 13, 14, 16, 17, 19, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            32, 33, 34, 35, 36, 38, 39, 40, 60, 61, 63, 64,
+        ] {
+            let armed = LocalPlayer {
+                weapon: Some(weapon),
+                ..me
+            };
+            assert!(
+                choose(Some(armed), &players, view, None).is_ok(),
+                "{weapon}"
+            );
+        }
     }
 
     #[test]
