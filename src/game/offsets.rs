@@ -1,9 +1,9 @@
 //! Which addresses inside `client.dll` Echo depends on.
 //!
 //! The values themselves are not written here. They come from the generated
-//! dumps in `vendor/cs2-dumper/`, taken verbatim from
-//! <https://github.com/a2x/cs2-dumper> so that updating is a file replacement
-//! rather than a transcription:
+//! dumps in `vendor/cs2-dumper/`, from <https://github.com/a2x/cs2-dumper>.
+//! Local corrections verified against the installed binary are noted in the
+//! dump header; recheck them before replacing it with an upstream snapshot:
 //!
 //! ```text
 //! for f in offsets client_dll; do
