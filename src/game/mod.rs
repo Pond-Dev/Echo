@@ -15,6 +15,7 @@ const CLIENT_MODULE: &str = "client.dll";
 pub struct Game {
     process: Process,
     client: Module,
+    offsets: offsets::Offsets,
 }
 
 impl Game {
@@ -27,11 +28,21 @@ impl Game {
         let Some(client) = process.module(CLIENT_MODULE)? else {
             return Ok(None);
         };
-        Ok(Some(Self { process, client }))
+        let offsets = offsets::Offsets::resolve(client.size)
+            .map_err(|error| AttachError::OffsetResolution(format!("{error:#}")))?;
+        Ok(Some(Self {
+            process,
+            client,
+            offsets,
+        }))
     }
 
     pub const fn client(&self) -> Module {
         self.client
+    }
+
+    pub const fn offsets(&self) -> &offsets::Offsets {
+        &self.offsets
     }
 
     pub const fn pid(&self) -> u32 {
@@ -52,7 +63,7 @@ impl Game {
         // twice for the same page and could straddle a write between them.
         let mut bytes = [0u8; 8];
         self.process
-            .read(self.client.base + offsets::module::VIEW_ANGLES, &mut bytes)?;
+            .read(self.client.base + self.offsets.view_angles, &mut bytes)?;
         Ok(ViewAngles {
             pitch: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             yaw: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
@@ -64,7 +75,7 @@ impl Game {
     /// `None` is an ordinary state, not a failure: there is no pawn in the
     /// main menu, between rounds, or while spectating.
     pub fn local_player(&self) -> windows::core::Result<Option<LocalPlayer>> {
-        let base = self.client.base + offsets::module::LOCAL_PLAYER_PAWN;
+        let base = self.client.base + self.offsets.local_player_pawn;
         let Some(pawn) = self.process.read_pointer(base)? else {
             return Ok(None);
         };
@@ -73,11 +84,11 @@ impl Game {
         // a round ending mid-tick is enough. Treat a failed dereference as
         // "no player right now" and try again next tick, rather than as a
         // fault: the next read either finds a pawn or does not.
-        let Ok(health) = self.process.read_i32(pawn + offsets::entity::HEALTH) else {
+        let Ok(health) = self.process.read_i32(pawn + self.offsets.health) else {
             return Ok(None);
         };
 
-        let team = Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?);
+        let team = Team::from_raw(self.process.read_u8(pawn + self.offsets.team)?);
         Ok(Some(LocalPlayer {
             pawn,
             health,
@@ -90,21 +101,21 @@ impl Game {
     fn active_weapon_definition(&self, pawn: usize) -> Option<u16> {
         let services = self
             .process
-            .read_pointer(pawn + offsets::pawn::WEAPON_SERVICES)
+            .read_pointer(pawn + self.offsets.weapon_services)
             .ok()??;
         let handle = self
             .process
-            .read_u32(services + offsets::weapon::ACTIVE_HANDLE)
+            .read_u32(services + self.offsets.active_handle)
             .ok()?;
-        let index = entities::handle_index(handle)?;
+        let index = self.offsets.entity.handle_index(handle)?;
         let system = self
             .process
-            .read_pointer(self.client.base + offsets::module::ENTITY_SYSTEM)
+            .read_pointer(self.client.base + self.offsets.entity_system)
             .ok()??;
         let weapon = self.entity(system, index).ok()??;
         let mut bytes = [0u8; 2];
         self.process
-            .read(weapon + offsets::weapon::ITEM_DEFINITION, &mut bytes)
+            .read(weapon + self.offsets.item_definition, &mut bytes)
             .ok()?;
         Some(u16::from_le_bytes(bytes))
     }
@@ -117,7 +128,7 @@ impl Game {
     pub fn players(&self) -> windows::core::Result<Vec<Player>> {
         let Some(system) = self
             .process
-            .read_pointer(self.client.base + offsets::module::ENTITY_SYSTEM)?
+            .read_pointer(self.client.base + self.offsets.entity_system)?
         else {
             return Ok(Vec::new());
         };
@@ -138,14 +149,14 @@ impl Game {
 
     /// Resolve one entity index to its address, through the chunk table.
     fn entity(&self, system: usize, index: u32) -> windows::core::Result<Option<usize>> {
-        let Some(chunk_pointer) = entities::chunk_pointer(system, index) else {
+        let Some(chunk_pointer) = self.offsets.entity.chunk_pointer(system, index) else {
             return Ok(None);
         };
         let Some(chunk) = self.process.read_pointer(chunk_pointer)? else {
             return Ok(None);
         };
         self.process
-            .read_pointer(chunk + entities::entry_offset(index))
+            .read_pointer(chunk + self.offsets.entity.entry_offset(index))
     }
 
     /// The pawn a controller is driving, and what it looks like right now.
@@ -159,8 +170,8 @@ impl Game {
     ) -> windows::core::Result<Option<Player>> {
         let handle = self
             .process
-            .read_u32(controller + offsets::controller::PAWN_HANDLE)?;
-        let Some(index) = entities::handle_index(handle) else {
+            .read_u32(controller + self.offsets.pawn_handle)?;
+        let Some(index) = self.offsets.entity.handle_index(handle) else {
             return Ok(None);
         };
         let Some(pawn) = self.entity(system, index)? else {
@@ -169,7 +180,7 @@ impl Game {
 
         let origin = self.origin_of(pawn)?;
         let eye = origin.and_then(|origin| {
-            let view = self.vector_at(pawn + offsets::pawn::VIEW_OFFSET).ok()?;
+            let view = self.vector_at(pawn + self.offsets.view_offset).ok()?;
             (view[0].abs() <= 16.0 && view[1].abs() <= 16.0 && (16.0..=80.0).contains(&view[2]))
                 .then_some([
                     origin[0] + view[0],
@@ -180,8 +191,8 @@ impl Game {
         let head = origin.and_then(|origin| self.head_of(pawn, origin));
         Ok(Some(Player {
             pawn,
-            health: self.process.read_i32(pawn + offsets::entity::HEALTH)?,
-            team: Team::from_raw(self.process.read_u8(pawn + offsets::entity::TEAM)?),
+            health: self.process.read_i32(pawn + self.offsets.health)?,
+            team: Team::from_raw(self.process.read_u8(pawn + self.offsets.team)?),
             origin,
             eye,
             head,
@@ -197,11 +208,11 @@ impl Game {
     fn origin_of(&self, entity: usize) -> windows::core::Result<Option<[f32; 3]>> {
         let Some(node) = self
             .process
-            .read_pointer(entity + offsets::entity::SCENE_NODE)?
+            .read_pointer(entity + self.offsets.scene_node)?
         else {
             return Ok(None);
         };
-        self.vector_at(node + offsets::scene_node::ORIGIN).map(Some)
+        self.vector_at(node + self.offsets.origin).map(Some)
     }
 
     /// The point to aim at: the centre of the head capsule, accepted only when
@@ -209,7 +220,7 @@ impl Game {
     fn head_of(&self, pawn: usize, origin: [f32; 3]) -> Option<[f32; 3]> {
         let node = self
             .process
-            .read_pointer(pawn + offsets::entity::SCENE_NODE)
+            .read_pointer(pawn + self.offsets.scene_node)
             .ok()??;
         let capsule = self.stable_head_capsule(node).ok()??;
         let centre = std::array::from_fn(|axis| (capsule[0][axis] + capsule[1][axis]) * 0.5);
@@ -226,7 +237,7 @@ impl Game {
     /// player ever had. It is worth another attempt, and worth none at all
     /// rather than aiming at it.
     fn stable_head_capsule(&self, node: usize) -> windows::core::Result<Option<[[f32; 3]; 2]>> {
-        let address = node + offsets::scene_node::BONE_ARRAY;
+        let address = node + self.offsets.bone_array;
         for _ in 0..3 {
             let Some(bones) = self.process.read_pointer(address)? else {
                 continue;
@@ -266,7 +277,7 @@ impl Game {
     /// is not naming the head, whatever the rest of the line says.
     pub fn geometry_probe(&self, pawn: usize) -> String {
         let eye_z = self
-            .vector_at(pawn + offsets::pawn::VIEW_OFFSET)
+            .vector_at(pawn + self.offsets.view_offset)
             .map(|view| view[2]);
         let mut line = format!(
             "bone-probe pawn=0x{pawn:X} eye_z={}",
@@ -275,15 +286,15 @@ impl Game {
         let mut probe = || -> Result<(), String> {
             let node = self
                 .process
-                .read_pointer(pawn + offsets::entity::SCENE_NODE)
+                .read_pointer(pawn + self.offsets.scene_node)
                 .map_err(|e| format!("scene-node-read:{e}"))?
                 .ok_or("scene-node-null")?;
             line += &format!(" node=0x{node:X}");
             let origin = self
-                .vector_at(node + offsets::scene_node::ORIGIN)
+                .vector_at(node + self.offsets.origin)
                 .map_err(|e| format!("origin-read:{e}"))?;
             line += &format!(" origin={}", crate::log::point(Some(origin)));
-            let address = node + offsets::scene_node::BONE_ARRAY;
+            let address = node + self.offsets.bone_array;
             let bones = self
                 .process
                 .read_pointer(address)

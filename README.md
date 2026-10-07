@@ -14,4 +14,8 @@ Every line carrying an aim point also carries `aim_z`: how far up the target, fr
 
 Build with `cargo build --release`, then open `target/release/echo.exe`. Close the console window to stop. Windows requests administrator access. Diagnostic output is written to `echo.log` beside the executable.
 
+Open CS2 before Echo. The embedded dumper from `cs2-killtimer` scans the running game once at startup and resolves module addresses, schema fields, entity layout and the bone-array pointer. No offset download or rebuild is needed when addresses move. Missing required fields, outdated scan patterns or an unsupported bone-transform layout stop startup with an error; there is no fallback to stale dumps. The log records `source=embedded-dumper` and the resolved values. The vendored dumper retains its MIT license in `vendor/cs2_dumper/LICENSE`.
+
+For a read-only live check, run `cargo test --lib live_offsets -- --ignored --nocapture` from an administrator terminal with CS2 open. This attaches and reads game state without sending mouse input.
+
 Mouse calibration and lock settings are constants in `src/aim/mod.rs`. Run `cargo test --lib` to check the geometry and selection rules.

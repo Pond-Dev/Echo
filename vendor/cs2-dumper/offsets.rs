@@ -1,7 +1,5 @@
 // Generated using https://github.com/a2x/cs2-dumper
-// 2026-10-01 06:22:34.554410 UTC
-// Local correction (2026-10-03): input/view and entity-system globals verified against installed client.dll.
-// client.dll SHA-256: D7DB25D48F1D10C5E0B0296E20ED803426EB9509DA41760DAEDA39DD35BA89B9
+// 2026-10-06 06:58:22.576223100 UTC
 
 #![allow(non_upper_case_globals, unused)]
 
@@ -10,19 +8,19 @@ pub mod cs2_dumper {
         // Module: client.dll
         pub mod client_dll {
             pub const dwCSGOInput: usize = 0x2576150;
-            pub const dwEntityList: usize = 0x2715818;
+            pub const dwEntityList: usize = 0x2717828;
             pub const dwGameEntitySystem: usize = 0x2715818;
             pub const dwGameEntitySystem_highestEntityIndex: usize = 0x2120;
             pub const dwGameRules: usize = 0x255CE50;
             pub const dwGlobalVars: usize = 0x222BE98;
             pub const dwGlowManager: usize = 0x255CE60;
             pub const dwLocalPlayerController: usize = 0x2538008;
-            pub const dwLocalPlayerPawn: usize = 0x2560698;
+            pub const dwLocalPlayerPawn: usize = 0x2562808;
             pub const dwPlantedC4: usize = 0x24C88D0;
             pub const dwPrediction: usize = 0x25605A0;
             pub const dwSensitivity: usize = 0x255D998;
             pub const dwSensitivity_sensitivity: usize = 0x58;
-            pub const dwViewAngles: usize = 0x25767D8;
+            pub const dwViewAngles: usize = 0x25787E8;
             pub const dwViewMatrix: usize = 0x2566910;
             pub const dwViewRender: usize = 0x2565D20;
             pub const dwWeaponC4: usize = 0x24C4A90;

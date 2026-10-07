@@ -33,10 +33,14 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     log.record(&format!(
         "diagnostics=head-ease-v8 pid={} cone={} response_ms={} deadzone={} head_index={} bone_array_offset=0x{:X} crosshair_weight={} switch_margin={}",
         game.pid(), aim::CONE, aim::RESPONSE_MS, aim::DEADZONE,
-        crate::game::offsets::scene_node::HEAD, crate::game::offsets::scene_node::BONE_ARRAY,
+        crate::game::offsets::scene_node::HEAD, game.offsets().bone_array,
         aim::CROSSHAIR_WEIGHT, aim::SWITCH_MARGIN,
     ));
     let mut locked = None;
+    log.record(&format!(
+        "offsets source=embedded-dumper values={:?}",
+        game.offsets()
+    ));
     let mut motion = aim::Motion::default();
     let mut last_state = None;
     let mut next_report = Instant::now();

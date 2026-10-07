@@ -24,6 +24,7 @@ pub enum AttachError {
     /// Opening the process was refused — almost always missing elevation.
     AccessDenied,
     Other(windows::core::Error),
+    OffsetResolution(String),
 }
 
 impl std::fmt::Display for AttachError {
@@ -32,6 +33,7 @@ impl std::fmt::Display for AttachError {
             Self::NotRunning => write!(f, "the process is not running"),
             Self::AccessDenied => write!(f, "access denied — run as administrator"),
             Self::Other(error) => write!(f, "{error}"),
+            Self::OffsetResolution(error) => write!(f, "offset resolution failed: {error}"),
         }
     }
 }
