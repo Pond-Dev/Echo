@@ -49,6 +49,10 @@ impl Game {
         self.process.pid()
     }
 
+    pub fn is_running(&self) -> windows::core::Result<bool> {
+        self.process.is_running()
+    }
+
     /// Confirm `client.dll` really is a loaded PE image. Cheap sanity check
     /// that separates "attached to the wrong thing" from "offset is stale".
     pub fn client_looks_like_a_module(&self) -> windows::core::Result<bool> {

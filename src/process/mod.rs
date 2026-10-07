@@ -7,13 +7,16 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, WAIT_FAILED, WAIT_TIMEOUT};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
     Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
+    WaitForSingleObject,
+};
 
 /// Why attaching failed, separated from the raw error because the caller can
 /// only act on some of these.
@@ -65,20 +68,34 @@ impl Process {
             return Err(AttachError::NotRunning);
         };
 
-        let handle =
-            match unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid) } {
-                Ok(handle) => handle,
-                Err(error) if error.code() == E_ACCESSDENIED => {
-                    return Err(AttachError::AccessDenied);
-                }
-                Err(error) => return Err(error.into()),
-            };
+        let handle = match unsafe {
+            OpenProcess(
+                PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error) if error.code() == E_ACCESSDENIED => {
+                return Err(AttachError::AccessDenied);
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         Ok(Self { handle, pid })
     }
 
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Check this exact process handle without waiting or matching a reused PID.
+    pub fn is_running(&self) -> windows::core::Result<bool> {
+        let state = unsafe { WaitForSingleObject(self.handle, 0) };
+        if state == WAIT_FAILED {
+            return Err(windows::core::Error::from_thread());
+        }
+        Ok(state == WAIT_TIMEOUT)
     }
 
     /// Look up a loaded module by name. `None` means it is not loaded yet,
@@ -202,6 +219,37 @@ fn wide_to_string(wide: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::wide_to_string;
+
+    #[test]
+    fn process_liveness_tracks_the_attached_handle_until_exit() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // A hidden helper waits for input, then exits normally. No game required.
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "set /p echo_lifecycle_test="])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn lifecycle helper");
+        let handle = unsafe { super::OpenProcess(super::PROCESS_SYNCHRONIZE, false, child.id()) }
+            .expect("open helper handle");
+        let process = super::Process {
+            handle,
+            pid: child.id(),
+        };
+        assert!(process.is_running().unwrap());
+        child.stdin.take().unwrap().write_all(b"done\r\n").unwrap();
+        child.wait().unwrap();
+        assert!(!process.is_running().unwrap());
+        assert!(
+            !process.is_running().unwrap(),
+            "the original handle stays exited"
+        );
+    }
 
     #[test]
     fn a_name_stops_at_the_terminator_and_ignores_the_garbage_after_it() {

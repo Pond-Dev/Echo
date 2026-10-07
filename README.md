@@ -12,7 +12,7 @@ Mouse movement eases toward the current head with a 35 ms response time constant
 
 Every line carrying an aim point also carries `aim_z`: how far up the target, from its own feet, that point sits. A standing player's eyes are at 64, so `aim_z` answers head-or-body directly — `grep -o 'aim_z=[-0-9.]*' echo.log | sort -n | uniq -c` is the whole check. `bone-probe` prints the same height for both ends of the capsule as `above_origin`, next to that player's own `eye_z`.
 
-Build with `cargo build --release`, then open `target/release/echo.exe`. Close the console window to stop. Windows requests administrator access. Diagnostic output is written to `echo.log` beside the executable.
+Build with `cargo build --release`, then open `target/release/echo.exe`. Echo runs in the background without a console window and exits when the attached CS2 process closes. Press Delete to unload Echo once startup scanning completes; the key works even when CS2 is not in front. Windows requests administrator access. Diagnostic output and startup failures are written to `echo.log` beside the executable; errors exit without waiting for input.
 
 Open CS2 before Echo. The embedded dumper from `cs2-killtimer` scans the running game once at startup and resolves module addresses, schema fields, entity layout and the bone-array pointer. No offset download or rebuild is needed when addresses move. Missing required fields, outdated scan patterns or an unsupported bone-transform layout stop startup with an error; there is no fallback to stale dumps. The log records `source=embedded-dumper` and the resolved values. The vendored dumper retains its MIT license in `vendor/cs2_dumper/LICENSE`.
 

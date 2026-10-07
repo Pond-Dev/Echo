@@ -13,21 +13,16 @@ const REPORT: Duration = Duration::from_secs(2);
 
 pub fn start() {
     let mut log = Log::create();
-    if let Some(path) = log.path() {
-        println!("log: {}", path.display());
-    }
-    log.say("Head AimLock active while CS2 is in front. Close this window to stop.");
+    log.record("Starting background Head AimLock; resolving CS2 offsets.");
     if let Err(error) = run(&mut log) {
-        log.say(&format!("failed: {error}"));
-        println!("Press Enter to close.");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        log.record(&format!("failed: {error}"));
     }
 }
 
 fn run(log: &mut Log) -> Result<(), AttachError> {
     let game = Game::attach()?.ok_or(AttachError::NotRunning)?;
     if !game.client_looks_like_a_module()? {
-        log.say("Invalid client.dll module.");
+        log.record("Invalid client.dll module.");
         return Ok(());
     }
     log.record(&format!(
@@ -46,6 +41,14 @@ fn run(log: &mut Log) -> Result<(), AttachError> {
     let mut next_report = Instant::now();
     let mut last_tick = next_report - FRAME;
     loop {
+        if input::unload_requested() {
+            log.record("Delete pressed; unloading Echo.");
+            return Ok(());
+        }
+        if !game.is_running()? {
+            log.record("CS2 exited; stopping Echo.");
+            return Ok(());
+        }
         let started = Instant::now();
         let elapsed = started.duration_since(last_tick);
         last_tick = started;
